@@ -1,0 +1,42 @@
+# Slack App マニフェスト
+#
+# https://api.slack.com/apps → Create New App → From an app manifest
+# でワークスペースを選び、この内容をそのまま貼り付ける。
+# Socket Mode の有効化・Bot スコープ・購読イベントが一括で設定される。
+#
+# 貼り付け後に手作業が必要なのは次の2つだけ:
+#   1. Basic Information → App-Level Tokens → Generate Token and Scopes
+#      （スコープ connections:write）→ xapp- トークンを取得
+#   2. Install to Workspace → xoxb- トークンを取得
+
+display_information:
+  name: ClaudeCode
+  description: Slack から自宅PCの Claude Code へ開発タスクを渡すブリッジ
+  background_color: "#1f2430"
+
+features:
+  bot_user:
+    display_name: ClaudeCode
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      # メンションイベントの受信
+      - app_mentions:read
+      # スレッドへの返信
+      - chat:write
+      # scripts/list_channels.py で channel_id を引くために必要
+      - channels:read
+      - groups:read
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  # Socket Mode。これにより Request URL（公開エンドポイント）が不要になる。
+  socket_mode_enabled: true
+  token_rotation_enabled: false

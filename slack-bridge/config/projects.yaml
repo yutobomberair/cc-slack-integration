@@ -1,0 +1,102 @@
+# Slack チャンネル ⇄ ローカルプロジェクトの対応表
+#
+# channel_id は Slack 内部ID（C から始まる）を使う。チャンネル名は変更されうるため
+# 識別子には使わない（CLAUDE.md §3.2）。
+# したがってチャンネル名を変えても、このファイルの channel_id は変更不要。
+#
+# channel_id の調べ方:
+#   python scripts/list_channels.py
+# もしくは Slack でチャンネル名 → 「チャンネル詳細」最下部の ID をコピーする。
+#
+# profile は permission_profiles のキーを指す。未指定なら "investigate"。
+#
+# allow_implement: true にすると、依頼文の先頭に「実装:」または「/impl」と書いた
+# ときだけ implement プロファイルへ昇格できる。既定は常に調査モードなので、
+# スマホから誤ってコード変更が走ることはない（CLAUDE.md §20）。
+# git 管理されていないプロジェクトでは、設定に関わらず実装モードを拒否する。
+#
+# allow_push: true にすると、コミット後に claude/<スレッド> ブランチへ push し、
+# PR 作成リンクを Slack へ返す。既定ブランチへは絶対に push せず、merge もしない。
+
+projects:
+
+  navigation-core:
+    channel_id: "C0C32DZS2HL"   # Slack: #navigation-core
+    name: "navigation-core"
+    working_directory: "C:/Users/yutob/work_env/navigation-core"
+    profile: investigate
+    allow_implement: true
+    allow_push: true
+
+  pet-camera:
+    channel_id: "C0C3YPE4LHW"        # Slack: #pet-camera
+    name: "pet-camera"
+    working_directory: "C:/Users/yutob/work_env/Pet-Camera"
+    profile: investigate
+    allow_implement: true
+    allow_push: true
+
+  business-contest:
+    channel_id: "C0C32DSKC4E"  # Slack: #business-contest
+    name: "business-contest"
+    working_directory: "C:/Users/yutob/work_env/business_contest"
+    profile: investigate
+    # git 管理外のため実装モードは使えない（許可しても Bridge 側で拒否される）
+    allow_implement: false
+
+  propose:
+    channel_id: "C0C3YPD0XUY"           # Slack: #propose
+    name: "propose"
+    working_directory: "C:/Users/yutob/work_env/propose"
+    profile: investigate
+    allow_implement: true
+    # リモート未設定のため push できない（許可しても Bridge 側でスキップ）
+    allow_push: false
+
+
+# Claude Code CLI の権限プロファイル（CLAUDE.md §20）。
+# Phase 1 では investigate のみを使う。implement は Phase 3 で解禁する。
+permission_profiles:
+
+  investigate:
+    description: "調査専用。読み取り系ツールのみ許可し、コード変更もシェル実行も行わない。"
+    tools: ["Read", "Grep", "Glob", "WebSearch", "WebFetch"]
+    permission_mode: null
+    disallowed_tools: []
+    max_budget_usd: 3.0
+
+  implement:
+    description: "ファイル編集を許可。Bash は与えないので任意コマンドは実行できない。"
+    # Bash を含めないことが要点。Slack 経由でシェルが一切開かない。
+    # git の commit は Bridge 側が行う（app/git_ops.py）ので、ここでは不要。
+    tools:
+      ["Read", "Grep", "Glob", "WebSearch", "WebFetch", "Write", "Edit", "TodoWrite"]
+    permission_mode: acceptEdits
+    disallowed_tools: []
+    max_budget_usd: 8.0
+
+
+runtime:
+  # Claude Code 1回あたりの実行時間上限（秒）
+  timeout_seconds: 1800
+  # 同時に走らせる Claude Code プロセスの数（MVP は 1 = 逐次実行）
+  max_workers: 1
+  # 省略時は Claude Code の既定モデル。"opus" / "sonnet" / "haiku" など。
+  model: null
+
+  # Slack スレッド = Claude Code セッション として会話を継続する（CLAUDE.md §11）。
+  # false にすると各メッセージが独立した実行になる。
+  session_continuation: true
+
+  # 実行中の経過表示を chat.update で更新する間隔（秒）。0 で無効。
+  progress_interval_seconds: 30
+
+  # MCP サーバを読み込まない。アカウント単位で有効な MCP サーバ
+  # （claude.ai Claude Docs 等）は無人実行では承認できず自動拒否されるだけなので、
+  # 毎回呼びに行く無駄を省くため既定で true。
+  strict_mcp_config: true
+
+  # push 後に GitHub Actions の完了を待つ上限（秒）。0 で CI 通知を行わない。
+  # .env の GITHUB_TOKEN が未設定の場合も通知はスキップされる。
+  ci_wait_seconds: 900
+  ci_poll_interval_seconds: 15
