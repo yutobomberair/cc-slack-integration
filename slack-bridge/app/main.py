@@ -15,7 +15,10 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+# builtin（生ソケット実装）ではなく websocket-client 版を使う。builtin は Windows で
+# 接続が約60秒ごとに落ち（WinError 10053/10054、SSL BAD_LENGTH）、復帰まで40秒ほど
+# 無接続になる。その間に来たメンションは Socket Mode では再送されず取りこぼす。
+from slack_bolt.adapter.socket_mode.websocket_client import SocketModeHandler
 
 from app import slack_handler
 from app.console import force_utf8_stdio
