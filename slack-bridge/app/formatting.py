@@ -126,25 +126,39 @@ def _mode_label(implement: bool) -> str:
     return ":pencil2: 実装モード" if implement else ":mag: 調査モード"
 
 
+def _model_label(model: str | None) -> str:
+    """実行モデルの表示。速度もコストも大きく変わるので毎回見えるようにする。"""
+    return f" / :brain: {model}" if model else ""
+
+
 def start_message(
-    project_name: str, continued: bool = False, implement: bool = False
+    project_name: str,
+    continued: bool = False,
+    implement: bool = False,
+    model: str | None = None,
 ) -> str:
     """実行開始時の1行目。以降 chat.update で書き換えていく（CLAUDE.md §12）。"""
     mode = "スレッドの会話を継続します" if continued else "処理を開始しました"
     return (
         f":hourglass_flowing_sand: {mode}。\n"
         f"Project: *{project_name}* / {_mode_label(implement)}"
+        f"{_model_label(model)}"
     )
 
 
 def progress_message(
-    project_name: str, elapsed: float, continued: bool = False, implement: bool = False
+    project_name: str,
+    elapsed: float,
+    continued: bool = False,
+    implement: bool = False,
+    model: str | None = None,
 ) -> str:
     """実行中の経過表示。start_message を chat.update で置き換える形で使う。"""
     mode = "継続実行中" if continued else "実行中"
     return (
         f":hourglass_flowing_sand: {mode}… （{format_duration(elapsed)} 経過）\n"
         f"Project: *{project_name}* / {_mode_label(implement)}"
+        f"{_model_label(model)}"
     )
 
 
@@ -153,6 +167,7 @@ def completed_header(
     elapsed: float,
     cost_usd: float | None = None,
     turns: int | None = None,
+    model: str | None = None,
 ) -> str:
     """完了時に開始メッセージを置き換えるヘッダ。"""
     stats = [format_duration(elapsed)]
@@ -162,7 +177,7 @@ def completed_header(
         stats.append(f"${cost_usd:.2f}")
     return (
         f":white_check_mark: 完了しました。（{' / '.join(stats)}）\n"
-        f"Project: *{project_name}*"
+        f"Project: *{project_name}*{_model_label(model)}"
     )
 
 

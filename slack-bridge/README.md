@@ -92,13 +92,17 @@ Slack へ投稿される文面（mrkdwn 変換・分割後）がそのまま標�
 
 ## 権限設計（CLAUDE.md §20）
 
-`--dangerously-skip-permissions` は使用していない。プロファイルは
-`config/projects.yaml` の `permission_profiles` で定義する。
+プロファイルは `config/projects.yaml` の `permission_profiles` で定義する。
 
 | プロファイル | 内容 |
 |---|---|
-| `investigate`（既定） | `--tools "Read,Grep,Glob,WebSearch,WebFetch"`。Bash / Edit / Write を含めないため、コード変更もシェル実行も構造的に起こりえない |
-| `implement` | 上記に `Write,Edit,TodoWrite` を加え `--permission-mode acceptEdits`。**Bash は含めない**ので任意コマンドは実行できない。詳細は「コード変更（Phase 3）」を参照 |
+| `implement`（既定） | `--tools` を渡さないので **Bash を含む全ツール**が使える。`--permission-mode bypassPermissions` により承認も求めない。PC で `claude` を起動したときと同じ |
+| `investigate` | `--tools "Read,Grep,Glob,WebSearch,WebFetch"`。Bash / Edit / Write を含めないため、コード変更もシェル実行も構造的に起こりえない |
+
+既定が `implement` なのは、Slack から依頼する人と PC で操作する人が同一人物であり、
+インターフェースの違いで権限が変わるのは不便なため。この設定は
+`--dangerously-skip-permissions` と実質的に同等で、CLAUDE.md §20 の制限を意図的に
+解除している。**取り消し手段は git だけ**なので、対象は git 管理下に置くことを勧める。
 
 全プロファイル共通で以下を付与する。
 
@@ -206,30 +210,37 @@ session_id = uuid5(namespace, "<channel_id>:<thread_ts>")
 
 ## コード変更（Phase 3）
 
-既定は常に調査モード。書き込みは**二重の鍵**が揃ったときだけ有効になる
-（CLAUDE.md §20「コード変更 → MVPでは明示的に許可」）。
-
-1. `config/projects.yaml` でそのプロジェクトに `allow_implement: true` があること
-2. 依頼文の**先頭**に昇格キーワードが書かれていること
+既定は各プロジェクトの `profile`（現在はすべて `implement`）。前置き無しで依頼すれば
+そのまま編集もシェル実行もできる。
 
 ```text
 @ClaudeCode
-実装: README のタイポを直して
+README のタイポを直して
 ```
 
-キーワードは `実装:` / `実装：` / `/impl` / `/implement` / `impl:`。行頭のみを見るので、
-本文中の「〜の実装について」には反応しない。キーワードが無ければ常に調査モードで動く。
+### 読み取り専用で走らせる
 
-### Bash を渡さない
+触らずに調べるだけにしたいときは、依頼文の**先頭**に降格キーワードを置く。
 
-`implement` プロファイルのツールは `Read, Grep, Glob, WebSearch, WebFetch, Write,
-Edit, TodoWrite` で、**Bash を含まない**。したがって Slack 経由でシェルが開く経路が
-存在せず、実行できるのはファイル編集だけになる。
+```text
+@ClaudeCode
+調査: 構成を教えて
+```
 
-git の操作は Bridge 側（`app/git_ops.py`）が行う。この分担には2つの利点がある。
+キーワードは `調査:` / `調査：` / `read:` / `/read:` / `/investigate:` / `investigate:`。
+**末尾のコロンは必須**（半角・全角どちらでも可）。行頭のみを見るので、本文中の
+「〜の調査について」には反応しない。昇格側の `実装:` / `impl:` なども従来どおり使えるが、
+既定が `implement` になったので通常は書く必要がない。両方を書いた場合は安全側
+（読み取り専用）に倒す。
 
-- 任意コマンドの実行経路が無い
-- commit を Claude の判断に委ねないので「編集したが commit し忘れた」が起きない
+プロジェクトに `allow_implement: false` を設定すると、そのチャンネルは調査専用になり
+昇格キーワードを拒否する。
+
+### git の扱い
+
+Claude は Bash を持つので自分で git を操作できるが、Bridge 側（`app/git_ops.py`）も
+実行の前後で差分を見て自動コミットする。Claude が自分でコミットまで済ませた場合、
+Bridge から見た差分は無いので二重コミットにはならない。
 
 ### コミットの範囲
 
@@ -239,8 +250,41 @@ git の操作は Bridge 側（`app/git_ops.py`）が行う。この分担には2
 
 ### git 管理外のプロジェクト
 
-`allow_implement` の設定に関わらず、git リポジトリでないプロジェクトでは実装モードを
-拒否する。変更を戻す手段が無い状態で書き込むのは危険なため。
+git リポジトリでないプロジェクトでも実装モードで実行する（`business-contest` が該当）。
+ただし差分の記録も自動コミットも行わないため、**変更を取り消す手段が無い**。
+安全網が要るなら対象ディレクトリで `git init` すれば、以降は自動コミットの対象になる。
+
+## モデルの指定
+
+依頼ごとに使うモデルを選べる。先頭にモデル名とコロンを置く。
+
+```text
+@ClaudeCode
+opus: 設計を詰めて
+
+@ClaudeCode
+調査 haiku: ざっと見て
+```
+
+モード指定との順序は問わない（`haiku 調査:` でも同じ）。指定が無ければ
+`config/projects.yaml` の `model`、それも未設定なら Claude Code の既定モデルで動く。
+
+使えるモデルは `allowed_models`（既定は `opus` / `sonnet` / `haiku` / `fable`）。
+**一覧に無い名前は実行前に弾いて Slack へ知らせる。** 打ち間違いを黙って既定モデルで
+走らせると、指定したつもりの利用者が気づけないまま別のコストで課金されるため。
+
+実行中のモデルは開始・経過・完了の各メッセージに表示される。
+
+```text
+:hourglass_flowing_sand: 処理を開始しました。
+Project: *navigation-core* / :pencil2: 実装モード / :brain: haiku
+```
+
+### ディレクティブの解釈規則
+
+先頭の「コロンまで」を見て、既知のトークン（実装キーワード・モデル名）だけで構成されて
+いればディレクティブとして扱う。既知のトークンが1つも無ければ普通の文章なので、
+`TODO: あとで見る` や `URL: https://... を調べて` が誤解釈されることはない。
 
 ## push と Pull Request（Phase 4）
 

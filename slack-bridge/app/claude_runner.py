@@ -62,6 +62,7 @@ def build_command(
     runtime: Runtime,
     session_id: str | None = None,
     resume: bool = False,
+    model: str | None = None,
 ) -> list[str]:
     """CLI 引数を組み立てる（プロンプトは stdin で渡すので argv には含めない）。
 
@@ -93,8 +94,10 @@ def build_command(
         cmd += ["--disallowedTools", pattern]
     if profile.max_budget_usd:
         cmd += ["--max-budget-usd", str(profile.max_budget_usd)]
-    if runtime.model:
-        cmd += ["--model", runtime.model]
+    # 依頼文での指定があればそれを優先し、無ければ設定の既定モデル。
+    chosen_model = model or runtime.model
+    if chosen_model:
+        cmd += ["--model", chosen_model]
     if session_id:
         # スレッド単位のセッション継続（CLAUDE.md §11, §23.2）。
         cmd += (["--resume", session_id] if resume else ["--session-id", session_id])
@@ -113,6 +116,7 @@ def run(
     runtime: Runtime,
     session_id: str | None = None,
     resume: bool = False,
+    model: str | None = None,
 ) -> ClaudeResult:
     """Claude Code を1回実行する。
 
@@ -120,18 +124,18 @@ def run(
     新規セッションとして1度だけやり直す。スレッドでの会話が復旧不能になるより、
     文脈を失ってでも応答を返すほうが実用的なため。
     """
-    result = _run_once(prompt, working_directory, profile, runtime, session_id, resume)
+    result = _run_once(prompt, working_directory, profile, runtime, session_id, resume, model)
 
     if resume and not result.ok and SESSION_MISSING_MARKER in result.error:
         logger.info("継続対象のセッションが見つかりません。新規セッションで再実行します")
-        result = _run_once(prompt, working_directory, profile, runtime, session_id, resume=False)
+        result = _run_once(prompt, working_directory, profile, runtime, session_id, False, model)
         result.session_restarted = True
 
     elif not resume and not result.ok and SESSION_EXISTS_MARKER in result.error:
         # 記録側は「未作成」と思っているが、実際には既に存在するケース。
         # 多重起動やブリッジの異常終了で起こりうる。継続として実行し直す。
         logger.info("セッションが既に存在します。継続として再実行します")
-        result = _run_once(prompt, working_directory, profile, runtime, session_id, resume=True)
+        result = _run_once(prompt, working_directory, profile, runtime, session_id, True, model)
 
     return result
 
@@ -143,9 +147,10 @@ def _run_once(
     runtime: Runtime,
     session_id: str | None,
     resume: bool,
+    model: str | None = None,
 ) -> ClaudeResult:
     cli = resolve_cli()
-    cmd = build_command(cli, profile, runtime, session_id=session_id, resume=resume)
+    cmd = build_command(cli, profile, runtime, session_id=session_id, resume=resume, model=model)
 
     logger.info(
         "claude 実行開始 cwd=%s profile=%s timeout=%ss session=%s",

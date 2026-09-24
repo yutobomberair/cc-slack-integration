@@ -133,7 +133,23 @@ def create_app(settings: Settings) -> App:
             return
 
         # 実行モードの決定（CLAUDE.md §20）。既定は常に調査。
-        mode = task_mode.resolve(prompt, project.profile, project.allow_implement)
+        mode = task_mode.resolve(
+            prompt,
+            project.profile,
+            project.allow_implement,
+            allowed_models=list(settings.runtime.allowed_models),
+        )
+        if mode.unknown_model:
+            # 打ち間違いを黙って既定モデルで走らせない。指定したつもりの利用者が
+            # 気づけないまま別のモデルで課金されるのを避ける。
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=task_mode.unknown_model_message(
+                    mode.unknown_model, list(settings.runtime.allowed_models)
+                ),
+            )
+            return
         if mode.denied:
             logger.warning(
                 "コード変更が要求されましたが許可されていません project=%s", project.key
@@ -144,26 +160,30 @@ def create_app(settings: Settings) -> App:
                 text=task_mode.implement_not_allowed_message(project.name),
             )
             return
-        if mode.is_implement and not git_ops.is_repo(project.working_directory):
-            logger.warning("git 管理外のためコード変更を拒否 project=%s", project.key)
+        prompt = mode.prompt
+        if not prompt:
             client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
-                text=task_mode.not_a_repo_message(project.name),
+                text=(
+                    ":thinking_face: 依頼内容が空でした。"
+                    "キーワードのあとに依頼を書いてください。"
+                ),
             )
             return
-        prompt = mode.prompt
 
         continued = settings.runtime.session_continuation and sessions.is_started(
             channel_id, thread_ts
         )
         logger.info(
-            "受理 project=%s channel=%s thread_ts=%s prompt_len=%d continued=%s",
+            "受理 project=%s channel=%s thread_ts=%s prompt_len=%d continued=%s profile=%s model=%s",
             project.key,
             channel_id,
             thread_ts,
             len(prompt),
             continued,
+            mode.profile_key,
+            mode.model or settings.runtime.model or "(既定)",
         )
 
         # 開始メッセージの ts を控える。以降これを chat.update で書き換えていく。
@@ -173,7 +193,10 @@ def create_app(settings: Settings) -> App:
                 channel=channel_id,
                 thread_ts=thread_ts,
                 text=formatting.start_message(
-                    project.name, continued=continued, implement=mode.is_implement
+                    project.name,
+                    continued=continued,
+                    implement=mode.is_implement,
+                    model=mode.model or settings.runtime.model,
                 ),
             )
             message_ts = posted.get("ts")
@@ -193,6 +216,7 @@ def create_app(settings: Settings) -> App:
             message_ts,
             continued,
             mode.profile_key,
+            mode.model,
         )
 
     app._slack_bridge_executor = executor  # 終了時に片付けられるよう保持
@@ -211,6 +235,7 @@ def _run_task(
     message_ts: str | None,
     continued: bool,
     profile_key: str,
+    model: str | None,
 ) -> None:
     """ワーカースレッド側。ここで例外を外に漏らさない。"""
     implement = profile_key == task_mode.IMPLEMENT
@@ -219,7 +244,11 @@ def _run_task(
         channel_id,
         message_ts,
         render=lambda elapsed: formatting.progress_message(
-            project.name, elapsed, continued=continued, implement=implement
+            project.name,
+            elapsed,
+            continued=continued,
+            implement=implement,
+            model=model or settings.runtime.model,
         ),
         interval=settings.runtime.progress_interval_seconds,
     )
@@ -235,7 +264,14 @@ def _run_task(
         # 同じスレッドのセッションを並行して更新しないよう直列化する。
         with thread_locks.for_thread(channel_id, thread_ts):
             profile = settings.profiles[profile_key]
-            before = git_ops.snapshot(project.working_directory) if implement else None
+            # git 管理外のプロジェクトでは snapshot を取らない。before が None だと
+            # 後段の commit 処理ごと飛ぶので、未管理ディレクトリでも実行はできる
+            # （ただし変更の自動 commit も差分報告も行われない）。
+            before = (
+                git_ops.snapshot(project.working_directory)
+                if implement and git_ops.is_repo(project.working_directory)
+                else None
+            )
             result = claude_runner.run(
                 prompt=prompt,
                 working_directory=project.working_directory,
@@ -243,6 +279,7 @@ def _run_task(
                 runtime=settings.runtime,
                 session_id=session_id,
                 resume=continued,
+                model=model,
             )
     except Exception as exc:  # noqa: BLE001 - ワーカーの最終防衛線
         logger.exception("タスク実行中に予期しない例外が発生しました")
@@ -271,7 +308,11 @@ def _run_task(
 
     elapsed = reporter.finish(
         formatting.completed_header(
-            project.name, reporter.elapsed, result.cost_usd, result.num_turns
+            project.name,
+            reporter.elapsed,
+            result.cost_usd,
+            result.num_turns,
+            model=model or settings.runtime.model,
         )
     )
     logger.info(
