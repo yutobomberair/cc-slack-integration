@@ -162,5 +162,3 @@ def wait_for_runs(
         sleep(poll_interval)
 
 
-def is_pending(run: WorkflowRun) -> bool:
-    return run.status in _PENDING_STATUSES

@@ -123,10 +123,6 @@ def test_push_creates_remote_branch(repo_with_remote):
     assert result.pushed is True
     assert result.branch == "claude/20260920-abc123"
 
-    remote_branches = subprocess.run(
-        ["git", "branch", "-r"], cwd=repo_with_remote,
-        capture_output=True, text=True, check=True,
-    ).stdout
     # fetch しないと remote-tracking には出ないので、bare 側を直接見る
     bare = Path(
         subprocess.run(["git", "remote", "get-url", "origin"], cwd=repo_with_remote,
