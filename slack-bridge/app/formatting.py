@@ -5,6 +5,15 @@ Slack は Markdown ではなく mrkdwn を解釈する。素の Markdown をそ�
 
 さらに Slack の1メッセージは実用上 3000 文字前後で頭打ちになるので、コードブロックを
 壊さないように分割する。
+
+利用者へ返す文面の置き場所は次の規則で分ける。
+
+* このモジュール … 特定のドメイン型を必要としないもの（開始・完了・失敗・断り文面）
+* 各ドメインのモジュール … その型を受け取るもの
+  （``artifacts.listing_message`` は ``Artifact`` を、``inbox.report`` は ``Saved`` を取る）
+
+すべてここへ集めると formatting が各ドメイン型を import することになり、
+依存が逆流するため。新しい文面を足すときはこの基準で置き場所を決める。
 """
 
 from __future__ import annotations
@@ -121,30 +130,58 @@ def format_duration(seconds: float) -> str:
     return f"{hours}時間{minutes:02d}分"
 
 
+def empty_request_message() -> str:
+    return (
+        ":thinking_face: 依頼内容が空でした。"
+        "メンションに続けて依頼を書いてください。"
+    )
+
+
+def empty_after_directive_message() -> str:
+    return (
+        ":thinking_face: 依頼内容が空でした。"
+        "キーワードのあとに依頼を書いてください。"
+    )
+
+
 def _mode_label(implement: bool) -> str:
     """実行モードの明示。書き込みが走っていることを一目で分かるようにする。"""
     return ":pencil2: 実装モード" if implement else ":mag: 調査モード"
 
 
+def _model_label(model: str | None) -> str:
+    """実行モデルの表示。速度もコストも大きく変わるので毎回見えるようにする。"""
+    return f" / :brain: {model}" if model else ""
+
+
 def start_message(
-    project_name: str, continued: bool = False, implement: bool = False
+    project_name: str,
+    continued: bool = False,
+    implement: bool = False,
+    model: str | None = None,
 ) -> str:
     """実行開始時の1行目。以降 chat.update で書き換えていく（CLAUDE.md §12）。"""
     mode = "スレッドの会話を継続します" if continued else "処理を開始しました"
     return (
         f":hourglass_flowing_sand: {mode}。\n"
         f"Project: *{project_name}* / {_mode_label(implement)}"
+        f"{_model_label(model)}"
     )
 
 
 def progress_message(
-    project_name: str, elapsed: float, continued: bool = False, implement: bool = False
+    project_name: str,
+    elapsed: float,
+    continued: bool = False,
+    implement: bool = False,
+    model: str | None = None,
 ) -> str:
     """実行中の経過表示。start_message を chat.update で置き換える形で使う。"""
     mode = "継続実行中" if continued else "実行中"
     return (
         f":hourglass_flowing_sand: {mode}… （{format_duration(elapsed)} 経過）\n"
         f"Project: *{project_name}* / {_mode_label(implement)}"
+        f"{_model_label(model)}"
     )
 
 
@@ -153,6 +190,7 @@ def completed_header(
     elapsed: float,
     cost_usd: float | None = None,
     turns: int | None = None,
+    model: str | None = None,
 ) -> str:
     """完了時に開始メッセージを置き換えるヘッダ。"""
     stats = [format_duration(elapsed)]
@@ -162,7 +200,7 @@ def completed_header(
         stats.append(f"${cost_usd:.2f}")
     return (
         f":white_check_mark: 完了しました。（{' / '.join(stats)}）\n"
-        f"Project: *{project_name}*"
+        f"Project: *{project_name}*{_model_label(model)}"
     )
 
 
@@ -183,8 +221,9 @@ def commit_report(
 ) -> str:
     """commit 内容の報告（CLAUDE.md §21）。
 
-    push は行わないため（§20）、GitHub のリンクは出さない。未 push のコミットへの
-    リンクは 404 になるだけで役に立たない。代わりに差分そのものを貼る。
+    この関数は commit 直後の報告なので、GitHub のリンクは出さない。push はこの後に
+    続く別の処理で、未 push のコミットへのリンクは 404 になるだけで役に立たない。
+    代わりに差分そのものを貼る。push できた場合のリンクは ``push_report`` が出す。
     """
     listed = "\n".join(f"• `{f}`" for f in files[:20])
     if len(files) > 20:
@@ -293,9 +332,6 @@ def ci_report(runs: list, timed_out: bool = False, error: str = "") -> str:
     return "\n".join(lines)
 
 
-def ci_waiting_note() -> str:
-    return "\n\n:hourglass_flowing_sand: CI の完了を待っています…"
-
 
 def no_changes_note() -> str:
     return "\n\n:information_source: ファイルへの変更はありませんでした。"
@@ -328,9 +364,6 @@ def session_restarted_note() -> str:
         "新しいセッションとして実行しました。スレッド内の文脈は引き継がれていません。"
     )
 
-
-def success_message(project_name: str, body: str) -> str:
-    return f":white_check_mark: 完了しました。\nProject: *{project_name}*\n\n{body}"
 
 
 def failure_message(project_name: str, error: str) -> str:

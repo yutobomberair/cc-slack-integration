@@ -19,7 +19,16 @@ from dotenv import load_dotenv  # noqa: E402
 from slack_sdk import WebClient  # noqa: E402
 from slack_sdk.errors import SlackApiError  # noqa: E402
 
-REQUIRED_BOT_SCOPES = {"app_mentions:read", "chat:write", "channels:read", "groups:read"}
+REQUIRED_BOT_SCOPES = {
+    "app_mentions:read",
+    "chat:write",
+    "channels:read",
+    "groups:read",
+    # ファイルの受け渡し。付与はインストール時に固定されるので、スコープを
+    # 追加しただけでは効かない（再インストールが要る）。ここで検出する。
+    "files:write",
+    "files:read",
+}
 
 
 def check_bot_token(token: str) -> bool:

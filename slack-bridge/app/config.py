@@ -56,9 +56,15 @@ class Runtime:
     timeout_seconds: int = 1800
     max_workers: int = 1
     model: str | None = None
+    # 依頼文の先頭で指定できるモデル。未知の名前は実行前に弾く。
+    allowed_models: tuple[str, ...] = ("opus", "sonnet", "haiku", "fable")
     # Slack スレッドと Claude Code セッションを紐付けるか（CLAUDE.md §11, §23.2）
     session_continuation: bool = True
     session_store_path: Path = BASE_DIR / "state" / "sessions.json"
+    # _share/sent/ に退避した送信済みファイルを保持する日数。0 で送信後すぐ削除。
+    share_retention_days: int = 7
+    # 出力ファイルの一覧（スレッド -> パス）。共有の番号を解決するために使う。
+    artifact_store_path: Path = BASE_DIR / "state" / "artifacts.json"
     # 実行中の経過表示を chat.update で更新する間隔（秒）。0 で無効。
     progress_interval_seconds: float = 30.0
     # MCP サーバを読み込まない（--strict-mcp-config）。
@@ -220,8 +226,13 @@ def _parse_runtime(raw: dict) -> Runtime:
         timeout_seconds=int(raw.get("timeout_seconds") or 1800),
         max_workers=max(1, int(raw.get("max_workers") or 1)),
         model=raw.get("model"),
+        allowed_models=tuple(
+            raw.get("allowed_models") or ("opus", "sonnet", "haiku", "fable")
+        ),
         session_continuation=bool(raw.get("session_continuation", True)),
         session_store_path=(Path(store) if store else BASE_DIR / "state" / "sessions.json"),
+        share_retention_days=int(raw.get("share_retention_days", 7)),
+        artifact_store_path=BASE_DIR / "state" / "artifacts.json",
         progress_interval_seconds=float(raw.get("progress_interval_seconds") or 30.0),
         strict_mcp_config=bool(raw.get("strict_mcp_config", True)),
         ci_wait_seconds=int(raw.get("ci_wait_seconds", 900)),

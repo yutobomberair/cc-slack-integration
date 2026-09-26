@@ -12,7 +12,8 @@ Slack のチャンネルをインターフェースに、自宅 Windows PC 上�
 **Phase 2** — Slack スレッド = Claude Code セッションの継続、`chat.update` による
 経過表示、同一スレッドの直列化。
 
-**Phase 3** — 二重の鍵によるコード変更の解禁、Bridge 側での変更検知とコミット。
+**Phase 3** — コード変更の解禁（既定は実装モード。`調査:` で読み取り専用へ降格）、
+Bridge 側での変更検知とコミット。
 
 **Phase 4** — スレッド専用ブランチへの push と PR 作成リンクの返信。
 
@@ -40,7 +41,7 @@ api.slack.com/apps → Create New App → From scratch。
 |---|---|
 | Socket Mode | **Enable** |
 | Basic Information → App-Level Tokens | Generate Token（scope: `connections:write`）→ `xapp-...` を控える |
-| OAuth & Permissions → Bot Token Scopes | `app_mentions:read`, `chat:write`, `channels:read`, `groups:read` |
+| OAuth & Permissions → Bot Token Scopes | `app_mentions:read`, `chat:write`, `files:write`, `files:read`, `channels:read`, `groups:read` |
 | Event Subscriptions | Enable → Subscribe to bot events に **`app_mention`** を追加 |
 | Install to Workspace | 実行後 `xoxb-...` を控える |
 
@@ -92,13 +93,17 @@ Slack へ投稿される文面（mrkdwn 変換・分割後）がそのまま標�
 
 ## 権限設計（CLAUDE.md §20）
 
-`--dangerously-skip-permissions` は使用していない。プロファイルは
-`config/projects.yaml` の `permission_profiles` で定義する。
+プロファイルは `config/projects.yaml` の `permission_profiles` で定義する。
 
 | プロファイル | 内容 |
 |---|---|
-| `investigate`（既定） | `--tools "Read,Grep,Glob,WebSearch,WebFetch"`。Bash / Edit / Write を含めないため、コード変更もシェル実行も構造的に起こりえない |
-| `implement` | 上記に `Write,Edit,TodoWrite` を加え `--permission-mode acceptEdits`。**Bash は含めない**ので任意コマンドは実行できない。詳細は「コード変更（Phase 3）」を参照 |
+| `implement`（既定） | `--tools` を渡さないので **Bash を含む全ツール**が使える。`--permission-mode bypassPermissions` により承認も求めない。PC で `claude` を起動したときと同じ |
+| `investigate` | `--tools "Read,Grep,Glob,WebSearch,WebFetch"`。Bash / Edit / Write を含めないため、コード変更もシェル実行も構造的に起こりえない |
+
+既定が `implement` なのは、Slack から依頼する人と PC で操作する人が同一人物であり、
+インターフェースの違いで権限が変わるのは不便なため。この設定は
+`--dangerously-skip-permissions` と実質的に同等で、CLAUDE.md §20 の制限を意図的に
+解除している。**取り消し手段は git だけ**なので、対象は git 管理下に置くことを勧める。
 
 全プロファイル共通で以下を付与する。
 
@@ -206,30 +211,37 @@ session_id = uuid5(namespace, "<channel_id>:<thread_ts>")
 
 ## コード変更（Phase 3）
 
-既定は常に調査モード。書き込みは**二重の鍵**が揃ったときだけ有効になる
-（CLAUDE.md §20「コード変更 → MVPでは明示的に許可」）。
-
-1. `config/projects.yaml` でそのプロジェクトに `allow_implement: true` があること
-2. 依頼文の**先頭**に昇格キーワードが書かれていること
+既定は各プロジェクトの `profile`（現在はすべて `implement`）。前置き無しで依頼すれば
+そのまま編集もシェル実行もできる。
 
 ```text
 @ClaudeCode
-実装: README のタイポを直して
+README のタイポを直して
 ```
 
-キーワードは `実装:` / `実装：` / `/impl` / `/implement` / `impl:`。行頭のみを見るので、
-本文中の「〜の実装について」には反応しない。キーワードが無ければ常に調査モードで動く。
+### 読み取り専用で走らせる
 
-### Bash を渡さない
+触らずに調べるだけにしたいときは、依頼文の**先頭**に降格キーワードを置く。
 
-`implement` プロファイルのツールは `Read, Grep, Glob, WebSearch, WebFetch, Write,
-Edit, TodoWrite` で、**Bash を含まない**。したがって Slack 経由でシェルが開く経路が
-存在せず、実行できるのはファイル編集だけになる。
+```text
+@ClaudeCode
+調査: 構成を教えて
+```
 
-git の操作は Bridge 側（`app/git_ops.py`）が行う。この分担には2つの利点がある。
+キーワードは `調査:` / `調査：` / `read:` / `/read:` / `/investigate:` / `investigate:`。
+**末尾のコロンは必須**（半角・全角どちらでも可）。行頭のみを見るので、本文中の
+「〜の調査について」には反応しない。昇格側の `実装:` / `impl:` なども従来どおり使えるが、
+既定が `implement` になったので通常は書く必要がない。両方を書いた場合は安全側
+（読み取り専用）に倒す。
 
-- 任意コマンドの実行経路が無い
-- commit を Claude の判断に委ねないので「編集したが commit し忘れた」が起きない
+プロジェクトに `allow_implement: false` を設定すると、そのチャンネルは調査専用になり
+昇格キーワードを拒否する。
+
+### git の扱い
+
+Claude は Bash を持つので自分で git を操作できるが、Bridge 側（`app/git_ops.py`）も
+実行の前後で差分を見て自動コミットする。Claude が自分でコミットまで済ませた場合、
+Bridge から見た差分は無いので二重コミットにはならない。
 
 ### コミットの範囲
 
@@ -239,8 +251,218 @@ git の操作は Bridge 側（`app/git_ops.py`）が行う。この分担には2
 
 ### git 管理外のプロジェクト
 
-`allow_implement` の設定に関わらず、git リポジトリでないプロジェクトでは実装モードを
-拒否する。変更を戻す手段が無い状態で書き込むのは危険なため。
+git リポジトリでないプロジェクトでも実装モードで実行する（`business-contest` が該当）。
+ただし差分の記録も自動コミットも行わないため、**変更を取り消す手段が無い**。
+安全網が要るなら対象ディレクトリで `git init` すれば、以降は自動コミットの対象になる。
+
+## 出力ファイルの共有
+
+Slack から依頼した場合、生成物は自宅PCの中にあるのでスマホからは見えない。
+そこで二段構えにしている（`app/artifacts.py`）。
+
+1. 実行後、この実行で出力されたファイルを一覧でスレッドへ出す（自動）
+2. 欲しいものだけを番号で受け取る
+
+```text
+:paperclip: この実行で出力されたファイル
+`1` `docs/report.md` （12.4 KB）
+`2` `data/summary.csv` （3.1 KB）
+
+受け取るには `共有: 1` のように番号を指定してください（`共有: all` で全部）。
+```
+
+```text
+@ClaudeCode
+共有: 1
+```
+
+キーワードは `共有:` / `share:` / `/share:` / `送って:` / `ちょうだい:`。番号のほか、
+`共有: report` のようにファイル名の部分一致でも指定できる（スマホからパスを正確に
+打たずに済ませるため）。複数指定は `共有: 1,3` や `共有: 1 3`。
+
+### なぜ毎回添付しないか
+
+実装タスクではソースが十数ファイル変わることがあり、それを全部送るとスレッドが
+埋まって肝心の回答が読めなくなる。一覧だけなら数行で済み、欲しいものは後から
+番号で取り出せる。
+
+### 共有はClaude を起動しない
+
+`共有:` はメンションを受けた時点でブリッジが直接処理する。Claude Code は走らないので
+課金もセッション更新も発生せず、応答は即座に返る。
+
+### 出力ファイルの検出
+
+| プロジェクト | 方法 |
+|---|---|
+| git 管理下 | `git status --porcelain` の差分。`.gitignore` が効くのでビルド生成物や venv を拾わない |
+| git 管理外 | mtime とサイズの走査。`venv` / `node_modules` / `__pycache__` / `.git` などは自前の除外リストで外す |
+
+調査モードではファイルを書けないので、一覧は実装モードのときだけ出る。
+
+### 制限
+
+- 1ファイル 50MB を超えるものは一覧に載るがアップロードしない
+- 一覧は1スレッドあたり直近30件まで。実行するたびに置き換わる
+- 番号はスレッド単位で `state/artifacts.json` に記録され、ブリッジを再起動しても有効
+
+## Claude から Slack へ送る（`_share/`）
+
+利用者が番号で選ぶのとは別に、**Claude 自身が「これを渡したい」と判断したもの**を
+送る経路がある。`_share/` に置けば、一覧を挟まずそのままスレッドへ添付される。
+
+```text
+@ClaudeCode
+売上データを集計して、結果をグラフ付きのレポートにして
+```
+
+Claude が `_share/report.md` を作れば、実行完了と同時に添付される。
+
+### なぜ Claude に Slack を触らせないか
+
+`claude_runner.py` の `subprocess.run` は `env=` を渡していないため、ブリッジの環境変数
+（`SLACK_BOT_TOKEN` を含む）が Claude の子プロセスへ継承される。したがって Claude は
+技術的には curl で Slack API を直接叩けるが、その経路は使わない。
+
+- 送信先（channel_id / thread_ts）を Claude に教える必要がない
+- Claude 側から見れば「ファイルを書く」だけで済み、API も認証も出てこない
+- 失敗がブリッジ側のログと Slack 返信に一本化される
+
+Claude は `_share/` の存在をプロンプトの前置きで知る（`_build_prompt`）。実装モードの
+ときだけ付けている。調査モードではそもそも書き込めないため。
+
+### `_share/` の扱い
+
+転送用の置き場であってプロジェクトの成果物ではないので、次の2つから外している。
+
+- **自動コミット** — リポジトリが共有ファイルで汚れないようにする
+- **出力ファイル一覧** — 自動添付済みのものが一覧にも出ると二重になる
+
+### `_share/` は送信の待ち行列
+
+`_share/` にあるもの = まだ送っていないもの、と扱う。送れたら `_share/sent/` へ
+移して行列から外す。
+
+```text
+_share/
+├── report.md        ← 次の実行で送られる
+└── sent/
+    └── summary.md   ← 送信済み。もう送られない
+```
+
+この形にしている理由は3つ。
+
+- **重複しない** — 送ったものは行列から居なくなるので、二度届かない
+- **失敗が自動で回復する** — 送れなかったファイルは残るので、次の実行で再試行される
+- **状態が目で見て分かる** — 記録ファイルではなくディレクトリが状態そのもの
+
+同名のファイルを繰り返し送った場合は `summary-1.md` のように退避先で採番するので、
+履歴も潰れない。
+
+### 退避分の保持期間
+
+`_share/sent/` は `share_retention_days`（既定 7 日）を過ぎたものを自動で掃除する。
+放っておくと膨らむため。`0` にすると退避せず、送信後すぐ削除する。
+
+```yaml
+runtime:
+  share_retention_days: 7   # 0 = 送信後すぐ削除
+```
+
+即削除ではなく既定で数日残すのは、**`_share/` のファイルにコピー元があるとは限らない**
+ため。Claude が成果物を最初から `_share/` に書くことがあり、その場合そこが唯一の実体に
+なる。実際、最初の転送テストで置かれた3件のうち1件はコピー元が無かった。
+
+ただし送信に成功していれば Slack 側には実体が残るので、掃除で失われるのは
+「ローカルの控え」だけ。掃除は未送信のファイル（`_share/` 直下）には触らない。
+
+以前は送信済みの内容ハッシュを `state/artifacts.json` に記録していたが、
+(1) 記録の上限を超えると古いものが「未送信」に戻って再送される、
+(2) 記録ファイルを失うと `_share/` の中身が全部もう一度届く、
+という2つの重複経路があった。ディレクトリを状態にすれば、どちらも起こらない。
+
+退避に失敗した場合（ファイルがロックされている等）は、次の実行で重複するため
+Slack へ警告を出す。黙って二度送らない。
+
+## Slack から受け取る（`_inbox/`）
+
+メンションにファイルを添付すると、プロジェクト直下の `_inbox/` へ降ろしたうえで
+Claude に場所を伝える。
+
+```text
+@ClaudeCode
+[売上.csv を添付]
+これを分析して
+```
+
+Claude が受け取る依頼文はこうなる。
+
+```text
+[Slack に添付されたファイルを次の場所へ保存しました]
+- _inbox/売上.csv
+
+これを分析して
+```
+
+本文を書かずに添付だけ送った場合は「内容を要約してください」として扱う。
+
+### 保存時の扱い
+
+| | |
+|---|---|
+| 保存先 | プロジェクト直下の `_inbox/`。プロジェクトのファイルに直接混ぜない |
+| 同名ファイル | 上書きせず `report-1.md` のように退避する。スマホからは送り直しが起きやすいため |
+| ファイル名 | パス区切りや `..` を潰して `_inbox/` の外へ出られないようにする |
+| 上限 | 1ファイル 50MB。申告サイズと実体の両方で見る |
+| 失敗 | 1件ずつ独立。1つ落とせなくても他は保存する |
+
+### 受け取りに伴うリスク
+
+`_inbox/` に降ろしたファイルは、Claude が Bash で読める場所に置かれる。**Slack に
+ファイルを投げられる人は、このPCで実行される内容に影響を与えられる**ということになる。
+1人のワークスペースなら実害は薄いが、チャンネルに人を追加する場合は前提が変わる。
+
+### 必要なスコープ
+
+`files:write`（送信）と `files:read`（受信）が必要。マニフェストには含めてあるが、
+**既存の App には自動で追加されない**。[api.slack.com/apps](https://api.slack.com/apps) →
+OAuth & Permissions → Bot Token Scopes に両方を追加し、Reinstall to Workspace を実行する。
+
+どちらも、スコープが無いまま使うと原因と手順を Slack へ返す。`files:read` が無い場合、
+Slack はエラーではなく HTML のログインページを返してくるため、Content-Type を見て
+判定している（黙って壊れたファイルを保存しないため）。
+
+## モデルの指定
+
+依頼ごとに使うモデルを選べる。先頭にモデル名とコロンを置く。
+
+```text
+@ClaudeCode
+opus: 設計を詰めて
+
+@ClaudeCode
+調査 haiku: ざっと見て
+```
+
+モード指定との順序は問わない（`haiku 調査:` でも同じ）。指定が無ければ
+`config/projects.yaml` の `model`、それも未設定なら Claude Code の既定モデルで動く。
+
+使えるモデルは `allowed_models`（既定は `opus` / `sonnet` / `haiku` / `fable`）。
+**一覧に無い名前は実行前に弾いて Slack へ知らせる。** 打ち間違いを黙って既定モデルで
+走らせると、指定したつもりの利用者が気づけないまま別のコストで課金されるため。
+
+実行中のモデルは開始・経過・完了の各メッセージに表示される。
+
+```text
+:hourglass_flowing_sand: 処理を開始しました。
+Project: *navigation-core* / :pencil2: 実装モード / :brain: haiku
+```
+
+### ディレクティブの解釈規則
+
+先頭の「コロンまで」を見て、既知のトークン（実装キーワード・モデル名）だけで構成されて
+いればディレクティブとして扱う。既知のトークンが1つも無ければ普通の文章なので、
+`TODO: あとで見る` や `URL: https://... を調べて` が誤解釈されることはない。
 
 ## push と Pull Request（Phase 4）
 

@@ -10,10 +10,12 @@
 #
 # profile は permission_profiles のキーを指す。未指定なら "investigate"。
 #
-# allow_implement: true にすると、依頼文の先頭に「実装:」または「/impl」と書いた
-# ときだけ implement プロファイルへ昇格できる。既定は常に調査モードなので、
-# スマホから誤ってコード変更が走ることはない（CLAUDE.md §20）。
-# git 管理されていないプロジェクトでは、設定に関わらず実装モードを拒否する。
+# 既定は implement。PC で claude を起動したときと同じ権限で動かすための設定で、
+# Slack から書き込みもシェルも使える。読み取りだけで走らせたいときは依頼文の先頭に
+# 「調査:」または「/read」と書く（app/task_mode.py）。
+#
+# allow_implement: false にすると、そのプロジェクトは調査専用に落ちる。
+
 #
 # allow_push: true にすると、コミット後に claude/<スレッド> ブランチへ push し、
 # PR 作成リンクを Slack へ返す。既定ブランチへは絶対に push せず、merge もしない。
@@ -24,7 +26,7 @@ projects:
     channel_id: "C0C32DZS2HL"   # Slack: #navigation-core
     name: "navigation-core"
     working_directory: "C:/Users/yutob/work_env/navigation-core"
-    profile: investigate
+    profile: implement
     allow_implement: true
     allow_push: true
 
@@ -32,7 +34,7 @@ projects:
     channel_id: "C0C3YPE4LHW"        # Slack: #pet-camera
     name: "pet-camera"
     working_directory: "C:/Users/yutob/work_env/Pet-Camera"
-    profile: investigate
+    profile: implement
     allow_implement: true
     allow_push: true
 
@@ -40,15 +42,15 @@ projects:
     channel_id: "C0C32DSKC4E"  # Slack: #business-contest
     name: "business-contest"
     working_directory: "C:/Users/yutob/work_env/business_contest"
-    profile: investigate
-    # git 管理外のため実装モードは使えない（許可しても Bridge 側で拒否される）
-    allow_implement: false
+    profile: implement
+    # git 管理外。変更を取り消す手段が無いことを承知のうえで解禁している。
+    allow_implement: true
 
   propose:
     channel_id: "C0C3YPD0XUY"           # Slack: #propose
     name: "propose"
     working_directory: "C:/Users/yutob/work_env/propose"
-    profile: investigate
+    profile: implement
     allow_implement: true
     # リモート未設定のため push できない（許可しても Bridge 側でスキップ）
     allow_push: false
@@ -66,14 +68,19 @@ permission_profiles:
     max_budget_usd: 3.0
 
   implement:
-    description: "ファイル編集を許可。Bash は与えないので任意コマンドは実行できない。"
-    # Bash を含めないことが要点。Slack 経由でシェルが一切開かない。
-    # git の commit は Bridge 側が行う（app/git_ops.py）ので、ここでは不要。
-    tools:
-      ["Read", "Grep", "Glob", "WebSearch", "WebFetch", "Write", "Edit", "TodoWrite"]
-    permission_mode: acceptEdits
+    description: "PC で claude を起動したときと同じ。全ツールを許可し、承認も求めない。"
+    # tools を null にすると --tools を渡さないので、Bash を含む全ツールが使える。
+    # 個別に列挙すると新しいツールが増えたときに silent な機能欠落になるため、
+    # 「PC と同じ」を意図するならここは絞らない。
+    tools: null
+    # --permission-prompts none と組み合わせるため、bypassPermissions が必要。
+    # acceptEdits では Bash が承認待ちになり、無人実行では自動拒否されてしまう。
+    # 事実上 --dangerously-skip-permissions と同等（CLAUDE.md §20 の制限を解除）。
+    # 取り消し手段は git のみなので、対象は git 管理下に置くことを推奨する。
+    permission_mode: bypassPermissions
     disallowed_tools: []
-    max_budget_usd: 8.0
+    # 既定が implement になり1回の実行が長くなるため、調査専用時の 8.0 から引き上げる。
+    max_budget_usd: 20.0
 
 
 runtime:
@@ -82,11 +89,20 @@ runtime:
   # 同時に走らせる Claude Code プロセスの数（MVP は 1 = 逐次実行）
   max_workers: 1
   # 省略時は Claude Code の既定モデル。"opus" / "sonnet" / "haiku" など。
+  # 依頼文の先頭で個別に指定できる（例: "haiku: 軽く調べて"）。
   model: null
+
+  # 依頼文で指定できるモデル。ここに無い名前は実行前に弾いて Slack へ知らせる。
+  allowed_models: ["opus", "sonnet", "haiku", "fable"]
 
   # Slack スレッド = Claude Code セッション として会話を継続する（CLAUDE.md §11）。
   # false にすると各メッセージが独立した実行になる。
   session_continuation: true
+
+  # _share/sent/ へ退避した送信済みファイルを保持する日数。
+  # 0 にすると送信後すぐ削除する（_share/ に直接生成されたファイルは
+  # コピー元が無いので、その場合 PC 上からは消える。Slack 側には残る）。
+  share_retention_days: 7
 
   # 実行中の経過表示を chat.update で更新する間隔（秒）。0 で無効。
   progress_interval_seconds: 30

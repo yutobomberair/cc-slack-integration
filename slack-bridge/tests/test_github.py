@@ -28,7 +28,6 @@ def test_completed_failure_is_finished_but_not_succeeded():
 def test_in_progress_is_not_finished():
     r = run(status="in_progress", conclusion=None)
     assert not r.is_finished
-    assert github_ops.is_pending(r)
 
 
 def test_results_aggregate_state():

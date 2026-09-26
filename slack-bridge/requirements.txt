@@ -1,4 +1,7 @@
 slack-bolt>=1.21,<2
 slack-sdk>=3.33,<4
+# Socket Mode の WebSocket 実装。未インストールだと slack-bolt が builtin の
+# 生ソケット実装にフォールバックし、Windows で接続が安定しない。
+websocket-client>=1.8,<2
 PyYAML>=6.0,<7
 python-dotenv>=1.0,<2

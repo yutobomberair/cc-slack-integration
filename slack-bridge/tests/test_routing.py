@@ -7,7 +7,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import PermissionProfile, Project, Runtime, Settings  # noqa: E402
 from app.project_router import route, unknown_channel_message  # noqa: E402
-from app.slack_handler import SeenEvents, strip_mentions  # noqa: E402
+from app.concurrency import SeenEvents  # noqa: E402
+from app.slack_handler import strip_mentions  # noqa: E402
 
 
 @pytest.fixture

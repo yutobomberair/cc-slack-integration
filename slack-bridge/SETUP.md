@@ -6,7 +6,7 @@
 
 - [x] `slack-bridge/` 実装一式
 - [x] venv 作成・依存関係インストール
-- [x] テスト 36件 パス
+- [x] テスト パス（現在 261件）
 - [x] `propose` の git 初期化
 
 ## Step 1. Slack App を作成（ブラウザ）

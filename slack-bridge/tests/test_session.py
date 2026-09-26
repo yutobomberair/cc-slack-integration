@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.claude_runner import build_command  # noqa: E402
 from app.config import PermissionProfile, Runtime  # noqa: E402
 from app.session_store import SessionStore, derive_session_id  # noqa: E402
-from app.slack_handler import ThreadLocks  # noqa: E402
+from app.concurrency import ThreadLocks  # noqa: E402
 
 
 def test_session_id_is_deterministic_per_thread():

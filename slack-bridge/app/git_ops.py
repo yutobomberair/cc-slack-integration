@@ -1,15 +1,15 @@
 """Bridge 側から git を操作する（CLAUDE.md §20, §21）。
 
-Claude Code に Bash を与えず、git 操作は Bridge が行う。この分担には2つの利点がある。
-
-* Slack 経由でシェルが一切開かない。実装タスクを解禁しても、実行できるのは
-  ファイル編集だけで、任意コマンドの実行経路が存在しない。
-* commit を Claude の判断に任せないので、「編集したが commit し忘れた」が起きない。
+Claude Code にも Bash を与えているので、Claude 自身が git を叩くこともできる。
+それでも Bridge 側で commit するのは、commit を Claude の判断に任せると
+「編集したが commit し忘れた」が起きるため。Claude が自分で commit まで済ませた
+場合は Bridge から見た差分が無いので、二重コミットにはならない。
 
 実行前後で ``git status --porcelain`` を比較し、**この実行で変化したファイルだけ**を
 commit する。実行前から dirty だったファイルは利用者の作業中のものなので触らない。
 
-push は行わない（CLAUDE.md §20「git push → 原則禁止」）。
+push は ``allow_push: true`` のプロジェクトでのみ、``claude/<スレッド>`` ブランチへ
+行う（``push_to_branch``）。既定ブランチへは push せず、merge もしない。
 """
 
 from __future__ import annotations
