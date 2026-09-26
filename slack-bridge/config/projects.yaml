@@ -99,6 +99,11 @@ runtime:
   # false にすると各メッセージが独立した実行になる。
   session_continuation: true
 
+  # _share/sent/ へ退避した送信済みファイルを保持する日数。
+  # 0 にすると送信後すぐ削除する（_share/ に直接生成されたファイルは
+  # コピー元が無いので、その場合 PC 上からは消える。Slack 側には残る）。
+  share_retention_days: 7
+
   # 実行中の経過表示を chat.update で更新する間隔（秒）。0 で無効。
   progress_interval_seconds: 30
 

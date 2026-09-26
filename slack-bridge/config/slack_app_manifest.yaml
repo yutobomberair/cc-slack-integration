@@ -26,6 +26,10 @@ oauth_config:
       - app_mentions:read
       # スレッドへの返信
       - chat:write
+      # 出力ファイルをスレッドへ添付する（「共有: 1」「_share/」）
+      - files:write
+      # 添付されたファイルを _inbox/ へ降ろす
+      - files:read
       # scripts/list_channels.py で channel_id を引くために必要
       - channels:read
       - groups:read

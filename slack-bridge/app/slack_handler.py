@@ -20,7 +20,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 from slack_bolt import App
 
-from app import claude_runner, formatting, git_ops, github_ops, project_router, task_mode
+from app import (
+    artifacts,
+    claude_runner,
+    formatting,
+    git_ops,
+    github_ops,
+    inbox,
+    project_router,
+    task_mode,
+)
 from app.config import Project, Settings
 from app.progress import ProgressReporter
 from app.session_store import SessionStore, derive_session_id
@@ -89,6 +98,7 @@ def create_app(settings: Settings) -> App:
     app = App(token=settings.bot_token)
     seen = SeenEvents()
     sessions = SessionStore(settings.runtime.session_store_path)
+    outputs = artifacts.ArtifactStore(settings.runtime.artifact_store_path)
     # 同一スレッドの二重実行を防ぐ。Claude Code のセッションは並行更新できないため、
     # 同じスレッドへ連続で依頼が来た場合は順番に処理する必要がある。
     thread_locks = ThreadLocks()
@@ -121,6 +131,9 @@ def create_app(settings: Settings) -> App:
 
         project = route.project
         prompt = strip_mentions(event.get("text", ""))
+        if not prompt and (event.get("files") or []):
+            # 添付だけ送られた場合。保存は下で行うので、依頼としては既定の指示を置く。
+            prompt = "添付されたファイルを確認して、内容を要約してください。"
         if not prompt:
             client.chat_postMessage(
                 channel=channel_id,
@@ -130,6 +143,23 @@ def create_app(settings: Settings) -> App:
                     "メンションに続けて依頼を書いてください。"
                 ),
             )
+            return
+
+        # Slack に添付されたファイルを先に降ろす。依頼文より前に置くのは、
+        # 「これを見て」と添付だけ送られる場合に保存自体は済ませたいため。
+        attached = inbox.save_files(
+            event.get("files") or [], project.working_directory, settings.bot_token
+        )
+        if attached:
+            client.chat_postMessage(
+                channel=channel_id, thread_ts=thread_ts, text=inbox.report(attached)
+            )
+
+        # 「共有: 1」は出力済みファイルの受け渡しであって開発依頼ではない。
+        # Claude を起動する前にここで片付ける（課金もセッション更新も発生しない）。
+        share_argument = artifacts.parse_share_request(prompt)
+        if share_argument is not None:
+            _share_files(client, outputs, project, channel_id, thread_ts, share_argument)
             return
 
         # 実行モードの決定（CLAUDE.md §20）。既定は常に調査。
@@ -208,6 +238,7 @@ def create_app(settings: Settings) -> App:
             settings,
             client,
             sessions,
+            outputs,
             thread_locks,
             project,
             prompt,
@@ -217,6 +248,7 @@ def create_app(settings: Settings) -> App:
             continued,
             mode.profile_key,
             mode.model,
+            attached,
         )
 
     app._slack_bridge_executor = executor  # 終了時に片付けられるよう保持
@@ -227,6 +259,7 @@ def _run_task(
     settings: Settings,
     client,
     sessions: SessionStore,
+    outputs: "artifacts.ArtifactStore",
     thread_locks: "ThreadLocks",
     project: Project,
     prompt: str,
@@ -236,6 +269,7 @@ def _run_task(
     continued: bool,
     profile_key: str,
     model: str | None,
+    attached: list["inbox.Saved"] | None = None,
 ) -> None:
     """ワーカースレッド側。ここで例外を外に漏らさない。"""
     implement = profile_key == task_mode.IMPLEMENT
@@ -272,8 +306,15 @@ def _run_task(
                 if implement and git_ops.is_repo(project.working_directory)
                 else None
             )
+            # git 管理外では mtime で出力ファイルを検出する。commit はできないが、
+            # 「何が出力されたか」を一覧で出すところまでは同じように動かす。
+            before_files = (
+                artifacts.scan(project.working_directory)
+                if implement and before is None
+                else None
+            )
             result = claude_runner.run(
-                prompt=prompt,
+                prompt=_build_prompt(prompt, attached, implement),
                 working_directory=project.working_directory,
                 profile=profile,
                 runtime=settings.runtime,
@@ -327,10 +368,27 @@ def _run_task(
     if result.session_restarted:
         body += formatting.session_restarted_note()
     pushed_sha = None
+    produced: list[str] = []
     if implement and before is not None:
-        commit_text, pushed_sha = _commit_and_report(project, prompt, before, thread_ts)
+        commit_text, pushed_sha, produced = _commit_and_report(
+            project, prompt, before, thread_ts
+        )
         body += commit_text
+    elif implement and before_files is not None:
+        produced = artifacts.changed_since(
+            before_files, artifacts.scan(project.working_directory)
+        )
     _post_chunks(client, channel_id, thread_ts, body)
+
+    # _share/ に置かれたものは「共有したい」という意思表示なので自動で添付する。
+    # 「この実行で変わったか」ではなく「まだ送っていないか」で見るので、前回
+    # 送信に失敗したファイルもここで再試行される。
+    if implement:
+        _auto_share(client, settings, project, channel_id, thread_ts)
+
+    # 残りは一覧だけ出す。中身は送らず、番号で取り出せるようにする（app/artifacts.py）。
+    _, rest = artifacts.split_shared(produced)
+    _report_outputs(client, outputs, project, channel_id, thread_ts, rest)
 
     # CI は分単位でかかるので、結果を待たずにここで応答を返し、完了後に追って投稿する。
     # ワーカーを占有しないよう専用スレッドで待つ（max_workers=1 でも他の依頼が詰まらない）。
@@ -355,23 +413,28 @@ def _watch_ci(settings, client, project, channel_id, thread_ts, sha) -> None:
 
 def _commit_and_report(
     project: Project, prompt: str, before: git_ops.Snapshot, thread_ts: str
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, list[str]]:
     """この実行で変わったファイルを commit し、報告文を組み立てる（CLAUDE.md §21）。
 
-    Claude Code には Bash を渡していないので、commit は必ずここを通る。
-    失敗しても変更は作業ツリーに残るため、その旨を伝えて握り潰さない。
+    返り値の3つめは、この実行で変わったファイルの一覧。Slack への共有候補として
+    呼び出し側が使う（``app/artifacts.py``）。commit に失敗しても一覧は返す。
+    ファイル自体は作業ツリーに残っているので、受け渡しはできるため。
     """
     cwd = project.working_directory
     try:
         changed, preexisting = git_ops.changed_since(cwd, before)
+        # _share/ は Slack への転送用の置き場であってプロジェクトの成果物ではない。
+        # commit するとリポジトリが共有ファイルで汚れるので、ここで外す。
+        _, changed = artifacts.split_shared(changed)
     except (git_ops.GitError, OSError) as exc:
         logger.exception("変更の検出に失敗しました project=%s", project.key)
-        return formatting.commit_failed_note(str(exc)), None
+        return formatting.commit_failed_note(str(exc)), None, []
 
     if not changed:
         return (
             formatting.no_changes_note() + formatting.skipped_dirty_note(preexisting),
             None,
+            [],
         )
 
     try:
@@ -380,12 +443,13 @@ def _commit_and_report(
         )
     except (git_ops.GitError, OSError) as exc:
         logger.exception("コミットに失敗しました project=%s", project.key)
-        return formatting.commit_failed_note(str(exc)), None
+        return formatting.commit_failed_note(str(exc)), None, changed
 
     if not commit.committed:
         return (
             formatting.no_changes_note() + formatting.skipped_dirty_note(preexisting),
             None,
+            changed,
         )
 
     logger.info(
@@ -403,7 +467,7 @@ def _commit_and_report(
     ) + formatting.skipped_dirty_note(preexisting)
 
     push_text, pushed = _push_and_report(project, thread_ts)
-    return report + push_text, (commit.sha if pushed else None)
+    return report + push_text, (commit.sha if pushed else None), changed
 
 
 def _push_and_report(project: Project, thread_ts: str) -> tuple[str, bool]:
@@ -479,6 +543,141 @@ def _ci_report(settings: Settings, project: Project, sha: str) -> str:
         result.error or "-",
     )
     return formatting.ci_report(result.runs, timed_out=result.timed_out, error=result.error)
+
+
+def _build_prompt(prompt: str, attached, implement: bool) -> str:
+    """Claude へ渡す実際の依頼文を組み立てる。
+
+    ブリッジしか知らない事情を2つだけ前置きする。どちらも伝えなければ
+    Claude には知りようがない。
+
+    * Slack から降ろした添付ファイルの置き場所
+    * ``_share/`` に置けば利用者へ届くということ
+    """
+    prefix = ""
+    if attached:
+        prefix += inbox.prompt_note(attached)
+    if implement:
+        prefix += artifacts.share_dir_note()
+    return prefix + prompt
+
+
+def _auto_share(
+    client, settings: Settings, project: Project, channel_id: str, thread_ts: str
+) -> None:
+    """``_share/`` にあるファイルをスレッドへ添付し、送れたものを退避する。
+
+    ``_share/`` は送信の待ち行列。そこにある = まだ送っていない、と等しいので、
+    送信できたら ``_share/sent/`` へ移して行列から外す。失敗したものは残るため
+    次の実行で自動的に再試行される。
+    """
+    pending = artifacts.list_share_files(project.working_directory)
+    if not pending:
+        return
+    items = artifacts.describe(project.working_directory, pending)
+    logger.info(
+        "_share/ のファイルを添付します project=%s thread_ts=%s files=%d",
+        project.key,
+        thread_ts,
+        len(items),
+    )
+    try:
+        sent = artifacts.upload(
+            client, channel_id, thread_ts, project.working_directory, items
+        )
+    except artifacts.UploadError as exc:
+        logger.error("_share/ の添付に失敗しました project=%s: %s", project.key, exc)
+        client.chat_postMessage(
+            channel=channel_id, thread_ts=thread_ts, text=f":x: {exc}"
+        )
+        return
+
+    stuck = artifacts.archive_sent(
+        project.working_directory, sent, settings.runtime.share_retention_days
+    )
+    if stuck:
+        # 退避できないと次の実行でもう一度届く。黙って重複させない。
+        logger.warning("退避できなかった送信済みファイル: %s", stuck)
+
+    report = artifacts.auto_share_report(sent, items, stuck)
+    if report:
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=report)
+
+
+def _report_outputs(
+    client,
+    outputs: "artifacts.ArtifactStore",
+    project: Project,
+    channel_id: str,
+    thread_ts: str,
+    produced: list[str],
+) -> None:
+    """出力ファイルの一覧を投稿し、番号で取り出せるよう記録する。
+
+    ファイル自体は添付しない。実装タスクではソースが十数ファイル変わることがあり、
+    それを全部送るとスレッドが埋まって肝心の回答が読めなくなるため。
+    """
+    if not produced:
+        return
+    items = artifacts.describe(project.working_directory, produced)
+    outputs.record(channel_id, thread_ts, project.key, [i.path for i in items])
+    logger.info(
+        "出力ファイルを記録しました project=%s thread_ts=%s files=%d",
+        project.key,
+        thread_ts,
+        len(items),
+    )
+    _post_chunks(client, channel_id, thread_ts, artifacts.listing_message(items))
+
+
+def _share_files(
+    client,
+    outputs: "artifacts.ArtifactStore",
+    project: Project,
+    channel_id: str,
+    thread_ts: str,
+    argument: str,
+) -> None:
+    """``共有: 1`` を処理する。Claude は起動しない。"""
+    recorded = outputs.get(channel_id, thread_ts)
+    if not recorded:
+        client.chat_postMessage(
+            channel=channel_id, thread_ts=thread_ts, text=artifacts.no_artifacts_message()
+        )
+        return
+
+    items = artifacts.describe(project.working_directory, recorded)
+    chosen, unresolved = artifacts.select(items, argument)
+    if unresolved and not chosen:
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=artifacts.unresolved_message(unresolved, items),
+        )
+        return
+
+    logger.info(
+        "ファイルを共有します project=%s thread_ts=%s files=%d",
+        project.key,
+        thread_ts,
+        len(chosen),
+    )
+    try:
+        sent = artifacts.upload(
+            client, channel_id, thread_ts, project.working_directory, chosen
+        )
+    except artifacts.UploadError as exc:
+        logger.error("ファイルの共有に失敗しました project=%s: %s", project.key, exc)
+        client.chat_postMessage(
+            channel=channel_id, thread_ts=thread_ts, text=f":x: {exc}"
+        )
+        return
+
+    report = artifacts.upload_report(sent, chosen)
+    if unresolved:
+        missing = "`, `".join(unresolved)
+        report += f"\n:warning: `{missing}` は見つかりませんでした。"
+    client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=report)
 
 
 def _post_chunks(client, channel_id: str, thread_ts: str, text: str) -> None:
