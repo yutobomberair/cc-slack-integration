@@ -40,6 +40,18 @@ claude-usage --test-notify    # 通知先の動作確認
 終了コードは、ペースに問題（使いすぎ・枠切れ）があれば `2`。監視スクリプトから使える。
 使い残し（`underuse`）は問題ではないので `0`。
 
+## Slack から聞く
+
+スマホから確認できないと意味が薄いので、`slack-bridge/` 経由で同じ内容が返る。
+
+```
+@ClaudeCode usage            @ClaudeCode usage projects
+@ClaudeCode usage status     @ClaudeCode usage alerts
+```
+
+呼び出し口は `claude_usage/api.py`（`report(command)`）。CLI の中身は argparse と
+標準出力に結び付いているので、外から使うにはここを通す。
+
 ## セットアップ
 
 利用枠の値は **statusline スクリプトの stdin にしか流れてこない**。こちらから取りに

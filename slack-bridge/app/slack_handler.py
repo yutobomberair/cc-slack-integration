@@ -20,7 +20,15 @@ from concurrent.futures import ThreadPoolExecutor
 
 from slack_bolt import App
 
-from app import artifacts, file_flow, formatting, project_router, task_flow, task_mode
+from app import (
+    artifacts,
+    file_flow,
+    formatting,
+    project_router,
+    task_flow,
+    task_mode,
+    usage,
+)
 from app import workdir as workdir_mod
 from app.concurrency import SeenEvents, ThreadLocks
 from app.config import Settings
@@ -143,6 +151,18 @@ def _accept(ctx: BridgeContext, thread: Thread, event: dict) -> TaskRequest | No
     ls_argument = workdir_mod.parse_list_directive(prompt)
     if ls_argument is not None:
         _list_workdir(ctx, thread, project, ls_argument)
+        return None
+
+    # 「usage」は利用枠の確認。通知は届くのに自分から聞けない、を解消するため。
+    usage_argument = usage.parse_directive(prompt)
+    if usage_argument is not None:
+        logger.info(
+            "利用枠を返しました project=%s thread_ts=%s 指定=%s",
+            project.key,
+            thread.thread_ts,
+            usage_argument or "(要点)",
+        )
+        thread.post_long(usage.report(usage_argument))
         return None
 
     mode = task_mode.resolve(
