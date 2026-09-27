@@ -599,3 +599,49 @@ def test_ls_outside_the_project_is_refused(dispatch, ran, nested):
     client = FakeClient()
     dispatch(client, text="ls: ../..")
     assert client.said("外へは移動できません")
+
+
+# --------------------------------------------------------------------------
+# usage は未登録チャンネルでも答える
+#
+# CLAUDE.md §15 は「未登録チャンネルで Claude Code を実行しない」という規定。
+# usage は Claude を起動せず作業ディレクトリにも触らないので対象外にする。
+# 通知が届くチャンネル（プロジェクト設定を持たない）で残量を聞けないと、
+# 通知だけ来て確認できないことになる。
+# --------------------------------------------------------------------------
+
+def test_usage_answers_in_an_unregistered_channel(dispatch, ran):
+    client = FakeClient()
+    dispatch(client, text="usage", channel="C_NOTIFY_ONLY")
+
+    assert ran == []                                  # Claude は起動しない
+    assert not client.said("プロジェクトが設定されていません")
+    assert client.said("Claude Code Usage") or client.said("スナップショット")
+
+
+def test_other_requests_are_still_refused_in_an_unregistered_channel(dispatch, ran):
+    client = FakeClient()
+    dispatch(client, text="構成を調べて", channel="C_NOTIFY_ONLY")
+
+    assert ran == []
+    assert client.said("C_NOTIFY_ONLY")               # §15 はそのまま効く
+
+
+def test_share_is_still_refused_in_an_unregistered_channel(dispatch, ran):
+    # 共有はプロジェクトのファイルを扱うので、未登録チャンネルでは答えない
+    client = FakeClient()
+    dispatch(client, text="共有: 1", channel="C_NOTIFY_ONLY")
+    assert client.said("C_NOTIFY_ONLY")
+
+
+def test_cd_is_still_refused_in_an_unregistered_channel(dispatch, ran):
+    client = FakeClient()
+    dispatch(client, text="cd: movie", channel="C_NOTIFY_ONLY")
+    assert client.said("C_NOTIFY_ONLY")
+
+
+def test_usage_works_in_a_registered_channel_too(dispatch, ran):
+    client = FakeClient()
+    dispatch(client, text="usage")
+    assert ran == []
+    assert not client.said("プロジェクトが設定されていません")

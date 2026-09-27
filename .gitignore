@@ -20,3 +20,6 @@ logs/
 # --- OS ---------------------------------------------------------------
 Thumbs.db
 desktop.ini
+# --- claude-usage ---
+# スナップショットは環境ごとに異なるので共有しない（~/.claude-usage が既定）
+claude-usage/**/__pycache__/

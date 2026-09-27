@@ -20,7 +20,15 @@ from concurrent.futures import ThreadPoolExecutor
 
 from slack_bolt import App
 
-from app import artifacts, file_flow, formatting, project_router, task_flow, task_mode
+from app import (
+    artifacts,
+    file_flow,
+    formatting,
+    project_router,
+    task_flow,
+    task_mode,
+    usage,
+)
 from app import workdir as workdir_mod
 from app.concurrency import SeenEvents, ThreadLocks
 from app.config import Settings
@@ -75,6 +83,22 @@ def create_app(settings: Settings) -> App:
         channel_id = event.get("channel", "")
         thread_ts = event.get("thread_ts") or event.get("ts")
         thread = Thread(client, channel_id, thread_ts)
+
+        # usage はアカウント単位の情報で、プロジェクトを必要としない。だから
+        # 未登録チャンネルでも答える。CLAUDE.md §15 は「未登録チャンネルで
+        # Claude Code を実行しない」という規定であって、ここは Claude を起動せず
+        # 作業ディレクトリにも触らない。通知が届くチャンネル（プロジェクト設定を
+        # 持たない）で残量を聞けないと、通知だけ来て確認できないことになる。
+        usage_argument = usage.parse_directive(strip_mentions(event.get("text", "")))
+        if usage_argument is not None:
+            logger.info(
+                "利用枠を返しました channel=%s thread_ts=%s 指定=%s",
+                channel_id,
+                thread_ts,
+                usage_argument or "(要点)",
+            )
+            thread.post_long(usage.report(usage_argument))
+            return
 
         task = _accept(ctx, thread, event)
         if task is None:
