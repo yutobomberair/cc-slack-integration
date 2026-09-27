@@ -3,6 +3,7 @@
     claude-usage              要点とペース判定
     claude-usage status       詳細（Confidence 付き）
     claude-usage --json       機械可読
+    claude-usage projects     プロジェクト別のトークン消費（Quota の配分ではない）
     claude-usage alerts       鳴った通知の履歴と、いまの判定
     claude-usage config       設定ファイルの雛形を書き出す
     claude-usage prune        保持期間を過ぎた履歴を捨てる
@@ -16,11 +17,11 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from claude_usage import alerts as alerts_mod
 from claude_usage import config as config_mod
-from claude_usage import display, notifiers, pace
+from claude_usage import display, notifiers, pace, transcript
 from claude_usage import snapshot as snap
 from claude_usage.snapshot import Snapshot, Window
 
@@ -227,6 +228,57 @@ statusline を設定すると、Claude Code が起動するたびに記録され
 手段がありません（詳細は .claude/doc/claude_code_usage_monitor_findings.md）。"""
 
 
+def render_projects(shot: Snapshot, days: int | None, by_repo: bool) -> str:
+    """プロジェクト別のトークン消費（仕様書 §7）。
+
+    既定では**いまの7日枠の期間**で集計する。暦の7日ではなく実際の枠に合わせるのは、
+    「この枠でどこが重かったか」が知りたい情報だから。
+    """
+    if days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        period = f"直近 {days} 日"
+    else:
+        since = transcript.window_start(shot.seven_day.resets_at)
+        period = "いまの7日枠" if since else "全期間"
+
+    result = transcript.aggregate(since=since, by_repo=by_repo)
+    rows = transcript.ranked(result)
+
+    lines = ["Projects", "-" * 40, ""]
+    lines.append(f"期間: {period}")
+    if since:
+        lines.append(f"  {since.astimezone():%Y-%m-%d %H:%M} 以降")
+    lines.append(f"  {result.files} ファイル / {result.total.messages:,} 応答")
+    lines.append("")
+
+    if not rows:
+        lines.append("集計できるレコードがありませんでした。")
+        return "\n".join(lines)
+
+    for path, tokens, share in rows:
+        label = transcript.label_for(path)
+        lines.append(f"{display.bar(share)} {share:5.1f}%  {label}")
+        lines.append(
+            f"             out {transcript.human(tokens.output)}"
+            f" / cache新 {transcript.human(tokens.cache_creation)}"
+            f" / cache読 {transcript.human(tokens.cache_read)}"
+        )
+    lines.append("")
+
+    models = transcript.ranked_models(result)
+    if models:
+        lines.append("モデル別")
+        for name, tokens, share in models:
+            lines.append(f"  {share:5.1f}%  {name}  (out {transcript.human(tokens.output)})")
+        lines.append("")
+
+    lines.append("-" * 40)
+    lines.append("比率は input + output + cache作成 で算出（cache読み直しは除外）。")
+    lines.append("Subscription Quota はプロジェクト単位で提供されないため、")
+    lines.append("これは利用枠の配分ではなく **トークン数の比率** です。")
+    return "\n".join(lines)
+
+
 def render_alerts(shot: Snapshot, history: list[Snapshot], now: datetime) -> str:
     """いまの判定と、鳴った履歴。閾値が妥当かを確かめるために両方出す。"""
     settings = config_mod.load()
@@ -283,7 +335,15 @@ def main(argv: list[str] | None = None) -> int:
         "command",
         nargs="?",
         default="summary",
-        choices=["summary", "status", "alerts", "config", "prune"],
+        choices=["summary", "status", "projects", "alerts", "config", "prune"],
+    )
+    parser.add_argument(
+        "--days", type=int, default=None, help="projects: 集計する日数（既定は今の7日枠）"
+    )
+    parser.add_argument(
+        "--by-cwd",
+        action="store_true",
+        help="projects: git リポジトリ単位にまとめず、作業ディレクトリごとに分ける",
     )
     parser.add_argument("--json", action="store_true", help="JSON で出力する")
     parser.add_argument(
@@ -329,6 +389,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         print(json.dumps(build_json(shot, history, now), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "projects":
+        display.write_line(render_projects(shot, args.days, by_repo=not args.by_cwd))
         return 0
 
     if args.command == "alerts":

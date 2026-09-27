@@ -834,3 +834,238 @@ def test_cli_prune(capsys):
     snap.save(shot(five=(10.0, NOW + timedelta(hours=3)), at=NOW - timedelta(days=200)))
     assert cli.main(["prune"]) == 0
     assert "削除しました" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# プロジェクト別集計（仕様書 §7）
+#
+# 最重要は「Quota の配分ではない」ことを守れているか。Subscription Quota は
+# プロジェクト単位で提供されないので、トークン数の比率としてしか出せない。
+# --------------------------------------------------------------------------
+
+from claude_usage import transcript  # noqa: E402
+
+
+def write_transcript(root: Path, name: str, records: list[dict]) -> Path:
+    """transcript を1本作る。``~/.claude/projects/<dir>/<session>.jsonl`` の形。"""
+    directory = root / name
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "session.jsonl"
+    with path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return path
+
+
+def assistant(cwd: str, *, out: int = 100, cache_new: int = 0, cache_read: int = 0,
+              inp: int = 1, at: datetime = NOW, model: str = "claude-opus-5") -> dict:
+    return {
+        "type": "assistant",
+        "cwd": cwd,
+        "timestamp": at.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "message": {
+            "model": model,
+            "usage": {
+                "input_tokens": inp,
+                "output_tokens": out,
+                "cache_creation_input_tokens": cache_new,
+                "cache_read_input_tokens": cache_read,
+            },
+        },
+    }
+
+
+def test_aggregates_tokens_per_cwd(tmp_path):
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [assistant("C:/work/alpha", out=300)])
+    write_transcript(root, "b", [assistant("C:/work/beta", out=100)])
+
+    result = transcript.aggregate(root=root, by_repo=False)
+    assert result.by_path["C:/work/alpha"].output == 300
+    assert result.total.output == 400
+    assert result.total.messages == 2
+
+
+def test_share_excludes_cache_reads(tmp_path):
+    """cache_read は桁が違う（実測 45億 vs 1,860万）。含めると比率が
+    セッションの長さに支配されて作業量を表さなくなる。"""
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [assistant("C:/work/alpha", out=100, cache_read=1_000_000)])
+    write_transcript(root, "b", [assistant("C:/work/beta", out=100)])
+
+    rows = transcript.ranked(transcript.aggregate(root=root, by_repo=False))
+    shares = {path: share for path, _, share in rows}
+    assert shares["C:/work/alpha"] == pytest.approx(50.0, abs=0.5)
+    assert shares["C:/work/beta"] == pytest.approx(50.0, abs=0.5)
+
+
+def test_cache_reads_are_still_reported(tmp_path):
+    # 比率からは外すが、内訳としては見せる
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [assistant("C:/work/alpha", cache_read=1234)])
+    result = transcript.aggregate(root=root, by_repo=False)
+    assert result.by_path["C:/work/alpha"].cache_read == 1234
+
+
+def test_only_assistant_records_are_counted(tmp_path):
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [
+        assistant("C:/work/alpha", out=100),
+        {"type": "user", "cwd": "C:/work/alpha", "message": {"usage": {"output_tokens": 999}}},
+    ])
+    assert transcript.aggregate(root=root, by_repo=False).total.output == 100
+
+
+def test_broken_lines_are_skipped(tmp_path):
+    root = tmp_path / "projects"
+    path = write_transcript(root, "a", [assistant("C:/work/alpha", out=100)])
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"usage": broken\n')
+        handle.write('"usage" not json at all\n')
+    assert transcript.aggregate(root=root, by_repo=False).total.output == 100
+
+
+def test_records_without_usage_are_ignored(tmp_path):
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [
+        assistant("C:/work/alpha", out=100),
+        {"type": "assistant", "cwd": "C:/work/alpha", "message": {"model": "x"}},
+    ])
+    assert transcript.aggregate(root=root, by_repo=False).total.messages == 1
+
+
+def test_missing_projects_dir_is_not_an_error(tmp_path):
+    result = transcript.aggregate(root=tmp_path / "nope")
+    assert result.total.messages == 0
+    assert result.by_path == {}
+
+
+# --- 期間の絞り込み ---
+
+def test_since_excludes_older_records(tmp_path):
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [
+        assistant("C:/work/alpha", out=100, at=NOW - timedelta(days=30)),
+        assistant("C:/work/alpha", out=200, at=NOW - timedelta(hours=1)),
+    ])
+    result = transcript.aggregate(since=NOW - timedelta(days=7), root=root, by_repo=False)
+    assert result.total.output == 200
+    assert result.skipped_outside_range == 1
+
+
+def test_records_without_a_timestamp_are_excluded_when_filtering(tmp_path):
+    root = tmp_path / "projects"
+    record = assistant("C:/work/alpha", out=100)
+    del record["timestamp"]
+    write_transcript(root, "a", [record])
+    result = transcript.aggregate(since=NOW - timedelta(days=7), root=root, by_repo=False)
+    assert result.total.output == 0
+
+
+def test_window_start_follows_the_actual_quota_window():
+    """暦の7日ではなく実際の枠に合わせる。「この枠でどこが重かったか」が見たい情報。"""
+    reset = NOW + timedelta(days=2)
+    start = transcript.window_start(int(reset.timestamp()))
+    assert start == pytest.approx(reset - timedelta(days=7), abs=timedelta(seconds=1))
+
+
+def test_window_start_without_a_reset():
+    assert transcript.window_start(None) is None
+
+
+# --- リポジトリ単位のまとめ（cd: で階層が分かれるため） ---
+
+def test_subdirectories_roll_up_to_the_repo_root(tmp_path):
+    repo = tmp_path / "propose"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "movie").mkdir()
+
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [assistant(str(repo), out=100)])
+    write_transcript(root, "b", [assistant(str(repo / "movie"), out=300)])
+
+    result = transcript.aggregate(root=root, by_repo=True)
+    assert result.by_path[str(repo)].output == 400      # cd: で移った分もまとまる
+    assert len(result.by_path) == 1
+
+
+def test_by_cwd_keeps_the_levels_apart(tmp_path):
+    repo = tmp_path / "propose"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "movie").mkdir()
+
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [assistant(str(repo), out=100)])
+    write_transcript(root, "b", [assistant(str(repo / "movie"), out=300)])
+
+    assert len(transcript.aggregate(root=root, by_repo=False).by_path) == 2
+
+
+def test_paths_outside_a_repo_stay_as_they_are(tmp_path):
+    plain = tmp_path / "loose"
+    plain.mkdir()
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [assistant(str(plain), out=100)])
+    assert str(plain) in transcript.aggregate(root=root, by_repo=True).by_path
+
+
+def test_missing_paths_do_not_break_rollup(tmp_path):
+    # 過去の記録に残っているだけで、もう存在しないパスがある
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [assistant("C:/gone/forever", out=100)])
+    assert "C:/gone/forever" in transcript.aggregate(root=root, by_repo=True).by_path
+
+
+# --- モデル別 ---
+
+def test_aggregates_by_model(tmp_path):
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [
+        assistant("C:/work/alpha", out=300, model="claude-opus-5"),
+        assistant("C:/work/alpha", out=100, model="claude-haiku-4-5"),
+    ])
+    rows = transcript.ranked_models(transcript.aggregate(root=root, by_repo=False))
+    assert [name for name, _, _ in rows] == ["claude-opus-5", "claude-haiku-4-5"]
+    assert rows[0][2] == pytest.approx(75.0, abs=1.0)
+
+
+# --- 表示 ---
+
+@pytest.mark.parametrize(
+    "count,text", [(999, "999"), (1500, "1.5k"), (2_500_000, "2.5M"), (3_000_000_000, "3.0B")]
+)
+def test_human_readable_token_counts(count, text):
+    assert transcript.human(count) == text
+
+
+def test_label_shortens_paths():
+    assert transcript.label_for("C:/Users/x/work/navigation-core") == "navigation-core"
+
+
+def test_label_keeps_the_parent_for_dot_directories():
+    # 「.claude」だけでは、どのプロジェクトのものか分からない
+    assert transcript.label_for("C:/work/propose/.claude") == "propose/.claude"
+
+
+def test_cli_projects_states_it_is_not_a_quota_split(capsys, monkeypatch, tmp_path):
+    """仕様書 §7 と §20。Quota の配分と誤解させない。"""
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [assistant("C:/work/alpha", out=100)])
+    monkeypatch.setattr(transcript, "projects_dir", lambda: root)
+
+    snap.save(shot(seven=(20.0, NOW + timedelta(days=3))))
+    assert cli.main(["projects"]) == 0
+    out = capsys.readouterr().out
+    assert "トークン数の比率" in out
+    assert "利用枠の配分ではな" in out
+    assert "cache読み直しは除外" in out
+
+
+def test_cli_projects_accepts_days(capsys, monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    write_transcript(root, "a", [assistant("C:/work/alpha", out=100)])
+    monkeypatch.setattr(transcript, "projects_dir", lambda: root)
+
+    snap.save(shot(five=(10.0, NOW + timedelta(hours=2))))
+    assert cli.main(["projects", "--days", "30"]) == 0
+    assert "直近 30 日" in capsys.readouterr().out

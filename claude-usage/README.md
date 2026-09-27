@@ -30,6 +30,7 @@ Pace
 claude-usage                  # 要点とペース判定
 claude-usage status           # 詳細（値ごとの Confidence 付き）
 claude-usage --json           # 機械可読
+claude-usage projects         # プロジェクト別のトークン消費
 claude-usage alerts           # いまの判定と、鳴った履歴
 claude-usage config           # 設定ファイルの雛形を書き出す
 claude-usage prune            # 保持期間を過ぎた履歴を捨てる
@@ -109,6 +110,59 @@ encode できない。素朴に `print` すると `UnicodeEncodeError` で**何�
 
 **高頻度の呼び出しを前提にする。** statusline は数百ミリ秒ごとに呼ばれうる。利用率が
 動いていないスナップショットは履歴に足さない。
+
+## プロジェクト別の消費
+
+枠が尽きそうなとき「どこを絞るか」を決める材料。
+
+```
+$ claude-usage projects
+期間: いまの7日枠
+  2026-09-26 22:00 以降
+  63 ファイル / 748 応答
+
+#####-----  51.0%  propose
+             out 820.7k / cache新 4.2M / cache読 227.9M
+#####-----  48.5%  slack_integration
+             out 443.2k / cache新 4.3M / cache読 128.7M
+```
+
+**これは利用枠の配分ではない。** Subscription Quota はプロジェクト単位で提供されて
+いないので、出せるのは**トークン数の比率**だけ。そこから「5時間枠の何%をどの
+プロジェクトが使ったか」を作って公式値のように見せない（仕様書 §7, §20）。
+
+期間は既定で**いまの7日枠**に合わせる（暦の7日ではない）。`--days 30` で任意の日数。
+
+### 比率の出し方を明示している理由
+
+トークンは4種類あり桁が大きく違う。実測値はこう。
+
+```
+cache_read       45億      既に作ったキャッシュの読み直し
+cache_creation    2億
+output         1,860万
+input           2.6万
+```
+
+`cache_read` を含めると比率が**セッションの長さに支配されて作業量を表さなくなる**
+ので、比率は `input + output + cache作成` で出し、`cache_read` は内訳として別に見せる。
+どちらで出しても順位はほぼ同じだった（21.0% と 24.2%）が、どの式かを黙るべきではない。
+
+### 階層は既定でまとめる
+
+`cd:` で階層を移れるので、`propose` と `propose/movie` が別々に記録される。既定では
+git リポジトリのルートまで遡ってまとめる。分けて見たいときは `--by-cwd`。
+
+```
+$ claude-usage projects --by-cwd
+  50.6%  movie
+  44.3%  slack_integration
+   2.5%  slack-bridge
+   1.8%  claude-usage
+```
+
+`~/.claude/projects/**/*.jsonl` を毎回読む。実測で 63ファイル 12,718レコードが
+**0.7秒**なのでキャッシュは持たない（古い値を出す危険が増えるだけ）。
 
 ## アラート
 
@@ -191,7 +245,7 @@ Excel でそのまま開けて、中身を目で確かめられる。プロジ�
 ## テスト
 
 ```bash
-python -m pytest tests/ -q          # 101 件
+python -m pytest tests/ -q          # 125 件
 python -m ruff check claude_usage tests --select F,E501 --line-length 100
 ```
 
@@ -206,7 +260,7 @@ python -m ruff check claude_usage tests --select F,E501 --line-length 100
 | 1 | 公式値の取得、statusline、CLI、ペース判定 | **済** |
 | 2 | ~~SQLite~~ → CSV で蓄積、保持期間（90日） | **済** |
 | 3 | 閾値・ペースのアラートと通知（terminal / file / Windows / Slack） | **済** |
-| 4 | プロジェクト別集計（transcript のトークン数から） | 未 |
+| 4 | プロジェクト別・モデル別集計（transcript のトークン数から） | **済** |
 | — | Discord 通知 | 未（`notifiers.py` に1関数足すだけ） |
 | 5 | Dashboard | 必要になったら |
 
