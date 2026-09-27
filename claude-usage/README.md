@@ -206,14 +206,30 @@ Slack への HTTP や PowerShell の起動に1〜3秒かかることがある。
 | `windows` | 無効 | `NotifyIcon` のバルーン。追加モジュール不要 |
 | `slack` | 無効 | チャンネルとトークンの両方が必要 |
 
-Slack を使う場合、トークンは**環境変数 `SLACK_BOT_TOKEN` を推奨**する（`config.json`
-にも書けるが、平文で置く必要がなければ置かない方がよい）。`slack-bridge/` の
-`.env` と同じトークンが使える。
+Slack のトークンは次の順で探す。
+
+1. `slack_token_file` が指すファイル（`KEY=value` 形式でも生のトークンでも読む）
+2. 環境変数 `SLACK_BOT_TOKEN`
+3. `slack_token`（設定ファイルへ直接書いた場合）
+
+**1 を勧める。** 既に `.env` にトークンがあるならそれを指せば済み、平文の複製を
+増やさずに一元化できる。`slack-bridge/` と同じトークンが使える。
 
 ```json
 {
-  "notifiers": { "slack": true, "slack_channel": "C0C32DZS2HL" }
+  "notifiers": {
+    "slack": true,
+    "slack_channel": "C0C2QTTL4D9",
+    "slack_token_file": "C:\Users\you\work\slack-bridge\.env"
+  }
 }
+```
+
+**Bot をそのチャンネルに招待しておくこと。** 公開チャンネルでも `chat:write` だけでは
+非参加のチャンネルへ投稿できず、`not_in_channel` で失敗する。
+
+```
+/invite @ClaudeCode
 ```
 
 ## 記録の置き場

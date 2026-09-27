@@ -48,8 +48,11 @@ class Notifiers:
     slack: bool = False
     #: Slack の投稿先チャンネル ID。未設定なら Slack へは送らない。
     slack_channel: str = ""
-    #: Slack の bot トークン。空なら環境変数 SLACK_BOT_TOKEN を見る。
+    #: Slack の bot トークン。直接書くよりは下の2つを使う。
     slack_token: str = ""
+    #: トークンを含むファイル。``KEY=value`` 形式でも、トークンだけでも読む。
+    #: 既に .env にトークンがあるなら、それを指すのが良い（平文の複製を増やさない）。
+    slack_token_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -124,6 +127,7 @@ TEMPLATE = {
         "slack": False,
         "slack_channel": "",
         "slack_token": "",
+        "slack_token_file": "",
     },
 }
 

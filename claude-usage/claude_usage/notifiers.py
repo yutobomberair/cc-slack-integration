@@ -18,16 +18,23 @@ PowerShell の起動に1〜3秒かかることがあり、数百ミリ秒ごと�
 
 鳴る頻度は低い（枠ごとにレベルが上がったときだけ）ので、起動のコストは問題にならない。
 
-## 認証情報は保存しない（仕様書 §17）
+## 認証情報を増やさない（仕様書 §17）
 
-Slack のトークンは設定ファイルに書けるが、既定では環境変数 ``SLACK_BOT_TOKEN`` を
-見る。通知の本文にもトークンは入れない。
+Slack のトークンの探す順は次のとおり。
+
+1. ``slack_token_file`` が指すファイル（``KEY=value`` 形式でも生のトークンでも読む）
+2. 環境変数 ``SLACK_BOT_TOKEN``
+3. ``slack_token``（設定ファイルへ直接書いた場合）
+
+1 を先に見るのは、既に ``.env`` にトークンがあるならそれを指せば済み、**平文の
+複製を増やさずに一元化できる**ため。通知の本文にトークンは入れない。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import urllib.error
@@ -130,12 +137,33 @@ def _ps_quote(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def notify_slack(alert: Alert, settings: Notifiers) -> bool:
-    """Slack へ投稿する。
+def read_token(settings: Notifiers) -> str:
+    """トークンを探す。見つからなければ空文字。
 
-    トークンは設定ファイルか環境変数から取る。**本文にトークンを含めない。**
+    ファイル指定を最優先にするのは、平文の複製を増やさずに一元化できるため
+    （既に ``.env`` にあるならそれを指せばよい）。
     """
-    token = settings.slack_token or os.environ.get("SLACK_BOT_TOKEN", "")
+    path = (settings.slack_token_file or "").strip()
+    if path:
+        try:
+            for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, _, value = line.partition("=")
+                    if key.strip() == "SLACK_BOT_TOKEN":
+                        return value.strip().strip("\"'")
+                elif line.startswith("xoxb-"):
+                    return line
+        except OSError:
+            pass
+    return os.environ.get("SLACK_BOT_TOKEN", "") or settings.slack_token
+
+
+def notify_slack(alert: Alert, settings: Notifiers) -> bool:
+    """Slack へ投稿する。**本文にトークンを含めない。**"""
+    token = read_token(settings)
     channel = settings.slack_channel
     if not token or not channel:
         return False
