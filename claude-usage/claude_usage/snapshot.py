@@ -10,16 +10,23 @@ CLI はその記録を読む。
 されないので実害は小さいが、**古い値を現在値として見せない**よう、読み出し側は必ず
 ``captured_at`` を確認して表示すること。
 
-Phase 1 では追記のみの JSONL に貯める。SQLite は Phase 2（履歴の問い合わせが必要に
-なってから）。JSONL でも消費速度の算出に足りる。
+履歴は**追記のみの CSV**。SQLite は使わない。この規模（1行 150 バイト弱、90日で
+数MB）では SQL の利点が出ず、CSV なら Excel でもそのまま開ける。プロジェクト別の
+集計を月単位で出す段階になったら移行を検討する。
+
+``raw``（statusline の生 JSON）は ``latest.json`` にだけ残す。フィールドが増えたときに
+追うのが目的で、履歴の全行に同じ構造を持たせる意味は無い。当初は履歴にも入れていたが、
+1行の 79% を占め 90日で 107MB になる見込みだったので外した。
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import os
+import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -158,16 +165,41 @@ def parse(payload: dict, now: datetime | None = None) -> Snapshot:
 
 
 # --------------------------------------------------------------------------
-# 保存と読み出し
+# 置き場
 # --------------------------------------------------------------------------
 
 def _history_path() -> Path:
-    return data_dir() / "snapshots.jsonl"
+    return data_dir() / "snapshots.csv"
 
 
 def _latest_path() -> Path:
     return data_dir() / "latest.json"
 
+
+def _lock_path() -> Path:
+    return data_dir() / "history.lock"
+
+
+#: 履歴の列。順序を変えないこと（既存ファイルを読めなくなる）。増やすのは末尾へ。
+COLUMNS = [
+    "captured_at",
+    "five_hour_used_percent",
+    "five_hour_resets_at",
+    "seven_day_used_percent",
+    "seven_day_resets_at",
+    "model",
+    "context_used_percent",
+    "input_tokens",
+    "output_tokens",
+    "session_cost_usd",
+    "session_id",
+    "project_dir",
+]
+
+
+# --------------------------------------------------------------------------
+# 保存
+# --------------------------------------------------------------------------
 
 def changed(previous: Snapshot | None, current: Snapshot) -> bool:
     """履歴に足す価値があるか。
@@ -185,6 +217,88 @@ def changed(previous: Snapshot | None, current: Snapshot) -> bool:
     )
 
 
+def _row(snapshot: Snapshot) -> list:
+    return [
+        snapshot.captured_at,
+        snapshot.five_hour.used_percent,
+        snapshot.five_hour.resets_at,
+        snapshot.seven_day.used_percent,
+        snapshot.seven_day.resets_at,
+        snapshot.model,
+        snapshot.context_used_percent,
+        snapshot.input_tokens,
+        snapshot.output_tokens,
+        snapshot.session_cost_usd,
+        snapshot.session_id,
+        snapshot.project_dir,
+    ]
+
+
+#: 取り残されたロックを何秒で無効とみなすか。
+_LOCK_STALE_SECONDS = 5.0
+
+
+class _Lock:
+    """追記と書き直しを直列化する最小のロック。
+
+    ターミナルを複数開くとそれぞれの Claude Code が statusline を呼ぶので、書き込みが
+    重なりうる。Windows では追記の原子性が保証されないため行が混ざる。
+
+    取れなければ **諦めて書かない**。1件の履歴を落としても消費速度の算出にほぼ影響が
+    無く、statusline を待たせるほうが害が大きい。
+    """
+
+    def __init__(self, attempts: int = 20, wait: float = 0.005) -> None:
+        self._attempts = attempts
+        self._wait = wait
+        self._fd: int | None = None
+
+    def __enter__(self) -> bool:
+        for _ in range(self._attempts):
+            try:
+                self._fd = os.open(_lock_path(), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                return True
+            except FileExistsError:
+                self._drop_if_stale()
+                time.sleep(self._wait)
+            except OSError:
+                return False
+        return False
+
+    def _drop_if_stale(self) -> None:
+        """異常終了で取り残されたロックを片付ける。
+
+        これが無いと、一度 statusline が強制終了した時点で以後ずっと書けなくなる。
+        """
+        try:
+            if time.time() - _lock_path().stat().st_mtime > _LOCK_STALE_SECONDS:
+                _lock_path().unlink()
+        except OSError:
+            pass
+
+    def __exit__(self, *exc_info) -> None:
+        if self._fd is None:
+            return
+        try:
+            os.close(self._fd)
+            _lock_path().unlink()
+        except OSError:
+            pass
+
+
+def _append(snapshot: Snapshot) -> None:
+    path = _history_path()
+    with _Lock() as acquired:
+        if not acquired:
+            return
+        is_new = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            if is_new:
+                writer.writerow(COLUMNS)
+            writer.writerow(_row(snapshot))
+
+
 def save(snapshot: Snapshot, raw: dict | None = None) -> None:
     """最新値を上書きし、利用率が動いていれば履歴にも足す。
 
@@ -198,7 +312,7 @@ def save(snapshot: Snapshot, raw: dict | None = None) -> None:
         previous = load_latest()
         body = asdict(snapshot)
         if raw is not None:
-            # フィールドが増えたときに後から追えるよう生データも残す。
+            # 生データは最新の1件だけ持つ。履歴の全行に持たせると 90日で 100MB を超える。
             # statusline の JSON に認証情報は含まれない（仕様書 §17 を確認済み）。
             body["raw"] = raw
 
@@ -207,21 +321,24 @@ def save(snapshot: Snapshot, raw: dict | None = None) -> None:
         tmp.replace(_latest_path())
 
         if changed(previous, snapshot):
-            with _history_path().open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(body, ensure_ascii=False) + "\n")
+            _append(snapshot)
     except OSError:
         pass
 
 
+# --------------------------------------------------------------------------
+# 読み出し
+# --------------------------------------------------------------------------
+
 def _from_dict(body: dict) -> Snapshot:
     def window(key: str) -> Window:
         raw = body.get(key) or {}
-        return Window(
-            used_percent=raw.get("used_percent"), resets_at=raw.get("resets_at")
-        )
+        return Window(used_percent=raw.get("used_percent"), resets_at=raw.get("resets_at"))
 
-    known = {f for f in Snapshot.__dataclass_fields__ if f not in
-             ("five_hour", "seven_day", "spend_limit")}
+    known = {
+        f for f in Snapshot.__dataclass_fields__
+        if f not in ("five_hour", "seven_day", "spend_limit")
+    }
     return Snapshot(
         five_hour=window("five_hour"),
         seven_day=window("seven_day"),
@@ -241,16 +358,96 @@ def load_latest() -> Snapshot | None:
         return None
 
 
-def load_history(limit: int = 500) -> list[Snapshot]:
-    """新しい順ではなく**古い順**に返す。消費速度は時系列で見るため。"""
+def _from_row(row: dict) -> Snapshot | None:
+    def number(key: str) -> float | None:
+        value = (row.get(key) or "").strip()
+        try:
+            return float(value) if value else None
+        except ValueError:
+            return None
+
+    def integer(key: str) -> int | None:
+        value = number(key)
+        return int(value) if value is not None else None
+
+    captured = (row.get("captured_at") or "").strip()
+    if not captured:
+        return None
     try:
-        lines = _history_path().read_text(encoding="utf-8").splitlines()
-    except OSError:
+        datetime.fromisoformat(captured)
+    except ValueError:
+        return None
+
+    return Snapshot(
+        captured_at=captured,
+        five_hour=Window(number("five_hour_used_percent"), integer("five_hour_resets_at")),
+        seven_day=Window(number("seven_day_used_percent"), integer("seven_day_resets_at")),
+        model=row.get("model") or None,
+        context_used_percent=number("context_used_percent"),
+        input_tokens=integer("input_tokens"),
+        output_tokens=integer("output_tokens"),
+        session_cost_usd=number("session_cost_usd"),
+        session_id=row.get("session_id") or None,
+        project_dir=row.get("project_dir") or None,
+    )
+
+
+def load_history(limit: int = 2000) -> list[Snapshot]:
+    """**古い順**に返す。消費速度は時系列で見るため。
+
+    壊れた行は読み飛ばす。複数セッションの書き込みが重なって混ざった行が残っていても、
+    そこで全部を諦めない。
+    """
+    try:
+        with _history_path().open("r", newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error):
         return []
     out: list[Snapshot] = []
-    for line in lines[-limit:]:
+    for row in rows[-limit:]:
         try:
-            out.append(_from_dict(json.loads(line)))
-        except (json.JSONDecodeError, TypeError, ValueError):
+            shot = _from_row(row)
+        except (TypeError, ValueError):
             continue
+        if shot is not None:
+            out.append(shot)
     return out
+
+
+def prune(retention_days: int = 90) -> int:
+    """保持期間を過ぎた履歴を捨てる（仕様書 §16）。返り値は消した行数。
+
+    書き直しなので追記と同じロックを取る。取れなければ何もしない（次の機会に消せる）。
+    """
+    if retention_days <= 0:
+        return 0
+    path = _history_path()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    try:
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error):
+        return 0
+
+    keep = []
+    for row in rows:
+        try:
+            if datetime.fromisoformat((row.get("captured_at") or "")) >= cutoff:
+                keep.append(row)
+        except ValueError:
+            continue     # 日付として読めない行は捨てる
+
+    removed = len(rows) - len(keep)
+    if removed <= 0:
+        return 0
+
+    with _Lock() as acquired:
+        if not acquired:
+            return 0
+        tmp = path.with_suffix(".csv.tmp")
+        with tmp.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(keep)
+        tmp.replace(path)
+    return removed

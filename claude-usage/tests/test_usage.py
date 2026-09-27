@@ -173,8 +173,9 @@ def test_no_snapshot_yet():
 
 
 def test_corrupt_history_lines_are_skipped():
+    # 複数セッションの書き込みが重なって混ざった行が残っても、全部を諦めない
     snap.save(shot(five=(10.0, NOW + timedelta(hours=3))))
-    path = snap.data_dir() / "snapshots.jsonl"
+    path = snap.data_dir() / "snapshots.csv"
     path.write_text(path.read_text(encoding="utf-8") + "壊れた行\n", encoding="utf-8")
     assert len(snap.load_history()) == 1
 
@@ -448,3 +449,81 @@ def test_summary_shows_the_update_time(capsys):
     cli.main([])
     # 取りに行けない値なので、いつの値かを必ず出す
     assert "Updated:" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# CSV での保存（SQLite は使わない。この規模では SQL の利点が出ない）
+# --------------------------------------------------------------------------
+
+def test_history_is_csv_with_a_fixed_header():
+    """CSV にしたのは Excel でそのまま開けるから。列順は固定。"""
+    snap.save(shot(five=(10.0, NOW + timedelta(hours=3))))
+    lines = (snap.data_dir() / "snapshots.csv").read_text(encoding="utf-8").splitlines()
+    assert lines[0].split(",") == snap.COLUMNS
+
+
+def test_history_rows_stay_small():
+    """raw を履歴に入れていた頃は1行 2.5KB で、90日 107MB になる見込みだった。"""
+    snap.save(shot(five=(10.0, NOW + timedelta(hours=3)), model="Opus 5"))
+    rows = (snap.data_dir() / "snapshots.csv").read_text(encoding="utf-8").splitlines()
+    assert len(rows[1].encode("utf-8")) < 200
+
+
+def test_raw_is_kept_only_in_latest():
+    snap.save(shot(five=(10.0, NOW + timedelta(hours=3))), raw={"rate_limits": {"x": 1}})
+    body = json.loads((snap.data_dir() / "latest.json").read_text(encoding="utf-8"))
+    assert "raw" in body
+    history_text = (snap.data_dir() / "snapshots.csv").read_text(encoding="utf-8")
+    assert "rate_limits" not in history_text
+
+
+def test_prune_drops_rows_past_retention():
+    reset = NOW + timedelta(hours=3)
+    snap.save(shot(five=(10.0, reset), at=NOW - timedelta(days=120)))
+    snap.save(shot(five=(11.0, reset), at=NOW - timedelta(days=1)))
+
+    assert snap.prune(retention_days=90) == 1
+    remaining = snap.load_history()
+    assert len(remaining) == 1
+    assert remaining[0].five_hour.used_percent == 11.0
+
+
+def test_prune_keeps_everything_within_retention():
+    snap.save(shot(five=(10.0, NOW + timedelta(hours=3))))
+    assert snap.prune(retention_days=90) == 0
+    assert len(snap.load_history()) == 1
+
+
+def test_prune_is_a_noop_without_history():
+    assert snap.prune(retention_days=90) == 0
+
+
+def test_prune_disabled_by_zero():
+    snap.save(shot(five=(10.0, NOW + timedelta(hours=3)), at=NOW - timedelta(days=500)))
+    assert snap.prune(retention_days=0) == 0
+    assert len(snap.load_history()) == 1
+
+
+def test_stale_lock_does_not_block_writes_forever():
+    """statusline が強制終了してロックが残ると、以後ずっと書けなくなる。"""
+    import os as _os
+    import time as _time
+
+    snap.data_dir().mkdir(parents=True, exist_ok=True)
+    lock = snap.data_dir() / "history.lock"
+    lock.write_text("", encoding="utf-8")
+    old = _time.time() - snap._LOCK_STALE_SECONDS - 1
+    _os.utime(lock, (old, old))
+
+    snap.save(shot(five=(10.0, NOW + timedelta(hours=3))))
+    assert len(snap.load_history()) == 1
+
+
+def test_held_lock_skips_the_history_but_keeps_latest():
+    """ロックが取れないときは履歴を諦める。statusline を待たせる害のほうが大きい。"""
+    snap.data_dir().mkdir(parents=True, exist_ok=True)
+    (snap.data_dir() / "history.lock").write_text("", encoding="utf-8")
+
+    snap.save(shot(five=(10.0, NOW + timedelta(hours=3)), model="Opus 5"))
+    assert snap.load_latest().model == "Opus 5"       # 最新値は残る
+    assert snap.load_history() == []                  # 履歴は落ちる
