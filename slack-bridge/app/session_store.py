@@ -27,9 +27,19 @@ logger = logging.getLogger(__name__)
 _NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://slack-bridge.local/claude-session")
 
 
-def derive_session_id(channel_id: str, thread_ts: str) -> str:
-    """同じスレッドからは常に同じ session_id を導出する。"""
-    return str(uuid.uuid5(_NAMESPACE, f"{channel_id}:{thread_ts}"))
+def derive_session_id(channel_id: str, thread_ts: str, workdir: str = "") -> str:
+    """同じスレッド・同じ作業階層からは常に同じ session_id を導出する。
+
+    ``workdir`` を混ぜるのは、Claude Code のセッションが作業ディレクトリ単位で
+    保存されているため。``cd:`` で階層を変えると別の保存先になり、元の session_id を
+    ``--resume`` しても見つからない。階層ごとに別の id にしておけば、行って戻って
+    きたときにそれぞれの会話が続く。
+
+    ``workdir`` が空（プロジェクト直下）のときは従来と同じ id になるので、
+    既存スレッドの継続は壊れない。
+    """
+    suffix = f"@{workdir}" if workdir else ""
+    return str(uuid.uuid5(_NAMESPACE, f"{channel_id}:{thread_ts}{suffix}"))
 
 
 class SessionStore:
@@ -69,8 +79,11 @@ class SessionStore:
             logger.exception("セッション記録の保存に失敗しました: %s", self._path)
 
     @staticmethod
-    def _key(channel_id: str, thread_ts: str) -> str:
-        return f"{channel_id}:{thread_ts}"
+    def _key(channel_id: str, thread_ts: str, workdir: str = "") -> str:
+        # 階層を変えると別セッションになるのでキーも分ける。直下のときは
+        # 従来と同じキーになるので、既存スレッドの継続は壊れない。
+        suffix = f"@{workdir}" if workdir else ""
+        return f"{channel_id}:{thread_ts}{suffix}"
 
     def _reload_if_changed(self) -> None:
         """ファイルが外部で更新されていれば読み直す。
@@ -88,16 +101,27 @@ class SessionStore:
             self._data = self._load()
             self._mtime_ns = mtime
 
-    def is_started(self, channel_id: str, thread_ts: str) -> bool:
-        """このスレッドで既に Claude Code セッションを開始済みか。"""
-        with self._lock:
-            self._reload_if_changed()
-            return self._key(channel_id, thread_ts) in self._data
+    def is_started(self, channel_id: str, thread_ts: str, workdir: str = "") -> bool:
+        """このスレッド・この作業階層で既に Claude Code セッションを開始済みか。
 
-    def record(self, channel_id: str, thread_ts: str, session_id: str, project_key: str) -> None:
+        階層を分けるのは、Claude Code のセッションが作業ディレクトリ単位で
+        保存されているため（``derive_session_id`` を参照）。
+        """
         with self._lock:
             self._reload_if_changed()
-            self._data[self._key(channel_id, thread_ts)] = {
+            return self._key(channel_id, thread_ts, workdir) in self._data
+
+    def record(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        session_id: str,
+        project_key: str,
+        workdir: str = "",
+    ) -> None:
+        with self._lock:
+            self._reload_if_changed()
+            self._data[self._key(channel_id, thread_ts, workdir)] = {
                 "session_id": session_id,
                 "project": project_key,
                 "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

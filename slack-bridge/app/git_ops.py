@@ -82,6 +82,31 @@ def is_repo(cwd: Path) -> bool:
         return False
 
 
+def repo_root(cwd: Path) -> Path | None:
+    """``cwd`` を含む git リポジトリのルート。リポジトリ外なら None。
+
+    git のパスの基準を揃えるために要る。``git status --porcelain`` は
+    **リポジトリルート基準**でパスを返すのに、``git add`` のパススペックは
+    **cwd 基準**で解釈される。サブディレクトリから動かすと
+
+        $ cd sub && git status --porcelain -uall
+        ?? sub/b.txt
+        $ git add -- sub/b.txt
+        fatal: pathspec 'sub/b.txt' did not match any files
+
+    となって自動コミットが必ず失敗する。だから git の操作は常にルートで行い、
+    porcelain が返すパスもルート基準として扱う。
+
+    Claude を起動する作業ディレクトリ（``TaskRequest.working_directory``）とは
+    別物である点に注意。あちらはプロジェクト配下の任意の階層になりうる。
+    """
+    try:
+        out = _run(cwd, "rev-parse", "--show-toplevel")
+    except (GitError, OSError):
+        return None
+    return Path(out) if out else None
+
+
 def current_branch(cwd: Path) -> str:
     try:
         return _run(cwd, "rev-parse", "--abbrev-ref", "HEAD")

@@ -355,12 +355,26 @@ class ArtifactStore:
     def _key(channel_id: str, thread_ts: str) -> str:
         return f"{channel_id}:{thread_ts}"
 
-    def record(self, channel_id: str, thread_ts: str, project_key: str, paths: list[str]) -> None:
+    def record(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        project_key: str,
+        paths: list[str],
+        base: str | None = None,
+    ) -> None:
+        """一覧を記録する。
+
+        ``base`` はパスを解決する基準。git 由来のパスはリポジトリルート基準で、
+        それはプロジェクト直下と一致しないことがある。あとで ``共有: 1`` を
+        解決するときに同じ基準を使わないとファイルを見失う。
+        """
         with self._lock:
             self._data = self._load()  # 別インスタンスの記録を踏み潰さない
             self._data[self._key(channel_id, thread_ts)] = {
                 "project": project_key,
                 "paths": paths[:MAX_LISTED],
+                "base": base,
                 "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
             if len(self._data) > self._max_entries:
@@ -374,3 +388,10 @@ class ArtifactStore:
             self._data = self._load()
             entry = self._data.get(self._key(channel_id, thread_ts))
             return list(entry.get("paths", [])) if entry else []
+
+    def get_base(self, channel_id: str, thread_ts: str) -> str | None:
+        """記録時のパス解決基準。古い記録には無いので None を返しうる。"""
+        with self._lock:
+            self._data = self._load()
+            entry = self._data.get(self._key(channel_id, thread_ts))
+            return entry.get("base") if entry else None

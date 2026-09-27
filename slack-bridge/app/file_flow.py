@@ -6,6 +6,10 @@
 * Slack → ローカル … ``_inbox/`` へ降ろし、置き場所を Claude へ伝える
 * ローカル → Slack（Claude の意思） … ``_share/`` にあるものを自動で添付する
 * ローカル → Slack（利用者の指定） … 一覧を出し、``共有: 1`` で取り出させる
+
+``_share/`` と ``_inbox/`` は **``cd:`` で階層を変えても常にプロジェクト直下**に置く。
+階層ごとに散ると ``共有: 1`` の番号と実体の対応が追えなくなるため。Claude が下の
+階層で動いている場合は、前置きで ``../_share/`` のような相対パスを伝える。
 """
 
 from __future__ import annotations
@@ -13,6 +17,8 @@ from __future__ import annotations
 import logging
 
 from app import artifacts, inbox, share_queue
+from pathlib import Path
+
 from app.config import Project, Settings
 from app.reply import Thread
 from app.task import TaskRequest
@@ -28,12 +34,16 @@ def build_prompt(task: TaskRequest) -> str:
 
     * Slack から降ろした添付ファイルの置き場所
     * ``_share/`` に置けば利用者へ届くということ
+
+    ``cd:`` で下の階層にいるときは、そこから見た相対パスで伝える。
+    プロジェクト直下の ``_share/`` を ``_share/`` と伝えてしまうと、Claude は
+    自分の cwd の下に作ってしまい、添付されない。
     """
     prefix = ""
     if task.attached:
-        prefix += inbox.prompt_note(task.attached)
+        prefix += inbox.prompt_note(task.attached, task.workdir_label)
     if task.implement:
-        prefix += share_queue.share_dir_note()
+        prefix += share_queue.share_dir_note(task.workdir_label)
     return prefix + task.prompt
 
 
@@ -81,6 +91,7 @@ def report_outputs(
     outputs: artifacts.ArtifactStore,
     project: Project,
     produced: list[str],
+    base: Path | None = None,
 ) -> None:
     """出力ファイルの一覧を投稿し、番号で取り出せるよう記録する。
 
@@ -89,8 +100,16 @@ def report_outputs(
     """
     if not produced:
         return
-    items = artifacts.describe(project.working_directory, produced)
-    outputs.record(thread.channel_id, thread.thread_ts, project.key, [i.path for i in items])
+    # git 由来のパスはリポジトリルート基準なので、解決の基準も揃える必要がある
+    # （プロジェクト直下と一致しないことがある）。
+    items = artifacts.describe(base or project.working_directory, produced)
+    outputs.record(
+        thread.channel_id,
+        thread.thread_ts,
+        project.key,
+        [i.path for i in items],
+        base=str(base) if base else None,
+    )
     logger.info(
         "出力ファイルを記録しました project=%s thread_ts=%s files=%d",
         project.key,
@@ -112,7 +131,9 @@ def share_on_request(
         thread.post(artifacts.no_artifacts_message())
         return
 
-    items = artifacts.describe(project.working_directory, recorded)
+    # 記録時と同じ基準で解決する（git 由来のパスはリポジトリルート基準）。
+    base = outputs.get_base(thread.channel_id, thread.thread_ts)
+    items = artifacts.describe(Path(base) if base else project.working_directory, recorded)
     chosen, unresolved = artifacts.select(items, argument)
     if unresolved and not chosen:
         thread.post(artifacts.unresolved_message(unresolved, items))
@@ -124,7 +145,7 @@ def share_on_request(
         thread.thread_ts,
         len(chosen),
     )
-    sent = _upload(thread, project, chosen)
+    sent = _upload(thread, project, chosen, base=Path(base) if base else None)
     if sent is None:
         return
 
@@ -135,7 +156,7 @@ def share_on_request(
     thread.post(report)
 
 
-def _upload(thread: Thread, project: Project, items) -> list[str] | None:
+def _upload(thread: Thread, project: Project, items, base: Path | None = None) -> list[str] | None:
     """アップロードの共通部分。返り値が None なら打ち切り（原因は投稿済み）。
 
     スコープ不足は何度試しても同じように失敗するので、手順を伝えて止める。
@@ -145,7 +166,7 @@ def _upload(thread: Thread, project: Project, items) -> list[str] | None:
             thread.client,
             thread.channel_id,
             thread.thread_ts,
-            project.working_directory,
+            base or project.working_directory,
             items,
         )
     except artifacts.UploadError as exc:

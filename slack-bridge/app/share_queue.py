@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 from app.artifacts import Artifact, human_size
-from app.paths import unique_path
+from app.paths import relative_prefix, unique_path
 
 logger = logging.getLogger(__name__)
 
@@ -166,13 +166,18 @@ def auto_share_report(
     return "\n".join(lines)
 
 
-def share_dir_note() -> str:
+def share_dir_note(workdir_label: str = "") -> str:
     """Claude へ ``_share/`` の使い方を伝える一文。
 
     伝えないと存在を知りようがないので、実装モードの依頼文の前に付ける。
+
+    ``_share/`` はプロジェクト直下に固定なので、``cd:`` で下の階層にいるときは
+    そこから見た相対パス（``../_share/``）で伝える。素の ``_share/`` と伝えると
+    Claude は自分の cwd の下に作ってしまい、添付されない。
     """
+    where = f"{relative_prefix(workdir_label)}{SHARE_DIR}/"
     return (
         "[この依頼は Slack 経由です。"
-        f"利用者に渡したいファイルは `{SHARE_DIR}/` へ置けば、"
+        f"利用者に渡したいファイルは `{where}` へ置けば、"
         "このスレッドへ自動で添付されます]\n\n"
     )

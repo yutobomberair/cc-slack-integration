@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from slack_bolt import App
 
 from app import artifacts, file_flow, formatting, project_router, task_flow, task_mode
+from app import workdir as workdir_mod
 from app.concurrency import SeenEvents, ThreadLocks
 from app.config import Settings
 from app.reply import Thread
@@ -54,6 +55,7 @@ def create_app(settings: Settings) -> App:
         settings=settings,
         sessions=SessionStore(settings.runtime.session_store_path),
         outputs=artifacts.ArtifactStore(settings.runtime.artifact_store_path),
+        workdirs=workdir_mod.WorkdirStore(settings.runtime.workdir_store_path),
         # 同一スレッドの二重実行を防ぐ。Claude Code のセッションは並行更新できない。
         thread_locks=ThreadLocks(),
     )
@@ -80,7 +82,7 @@ def create_app(settings: Settings) -> App:
 
         logger.info(
             "受理 project=%s channel=%s thread_ts=%s prompt_len=%d continued=%s "
-            "profile=%s model=%s",
+            "profile=%s model=%s workdir=%s",
             task.project.key,
             channel_id,
             thread_ts,
@@ -88,6 +90,7 @@ def create_app(settings: Settings) -> App:
             task.continued,
             task.profile_key,
             task.model or settings.runtime.model or "(既定)",
+            task.workdir_label or "(直下)",
         )
         executor.submit(task_flow.run_task, ctx, client, task)
 
@@ -130,6 +133,18 @@ def _accept(ctx: BridgeContext, thread: Thread, event: dict) -> TaskRequest | No
         file_flow.share_on_request(thread, ctx.outputs, project, share_argument)
         return None
 
+    # 「cd: movie」も同じ。作業階層を記録するだけで Claude は起動しない。
+    cd_argument = workdir_mod.parse_directive(prompt)
+    if cd_argument is not None:
+        _change_workdir(ctx, thread, project, cd_argument)
+        return None
+
+    # 「ls」はディレクトリを見るだけ。cd: の移動先を知るために要る。
+    ls_argument = workdir_mod.parse_list_directive(prompt)
+    if ls_argument is not None:
+        _list_workdir(ctx, thread, project, ls_argument)
+        return None
+
     mode = task_mode.resolve(
         prompt,
         project.profile,
@@ -155,8 +170,18 @@ def _accept(ctx: BridgeContext, thread: Thread, event: dict) -> TaskRequest | No
         thread.post(formatting.empty_after_directive_message())
         return None
 
+    # このスレッドで選ばれている階層。cd: していなければプロジェクト直下。
+    label = ctx.workdirs.get(thread.channel_id, thread.thread_ts)
+    try:
+        chosen_dir = workdir_mod.resolve(project.working_directory, label)
+    except workdir_mod.WorkdirError:
+        # 記録した階層が消えている（リポジトリを整理した等）。直下へ戻して続ける。
+        logger.warning("記録された作業階層が使えません project=%s label=%s", project.key, label)
+        ctx.workdirs.set(thread.channel_id, thread.thread_ts, project.key, "")
+        label, chosen_dir = "", project.working_directory
+
     continued = settings.runtime.session_continuation and ctx.sessions.is_started(
-        thread.channel_id, thread.thread_ts
+        thread.channel_id, thread.thread_ts, label
     )
     # 開始メッセージの ts を控える。以降これを chat.update で書き換えていく。
     message_ts = thread.post(
@@ -165,6 +190,7 @@ def _accept(ctx: BridgeContext, thread: Thread, event: dict) -> TaskRequest | No
             continued=continued,
             implement=mode.profile_key == task_mode.IMPLEMENT,
             model=mode.model or settings.runtime.model,
+            workdir=label,
         )
     )
     return TaskRequest(
@@ -177,4 +203,72 @@ def _accept(ctx: BridgeContext, thread: Thread, event: dict) -> TaskRequest | No
         continued=continued,
         model=mode.model,
         attached=attached,
+        workdir=chosen_dir,
+    )
+
+
+def _change_workdir(ctx: BridgeContext, thread: Thread, project, requested: str) -> None:
+    """``cd: movie`` を処理する。Claude は起動しない。
+
+    引数が空なら現在の階層を答える。プロジェクトの外を指す指定は弾く。
+    """
+    options = workdir_mod.candidates(project.working_directory)
+    current = ctx.workdirs.get(thread.channel_id, thread.thread_ts)
+
+    if not requested:
+        thread.post(workdir_mod.current_message(project.name, current, options))
+        return
+
+    try:
+        target = workdir_mod.resolve(project.working_directory, requested)
+    except workdir_mod.WorkdirError as exc:
+        logger.info("作業階層の指定を拒否しました project=%s 指定=%s", project.key, requested)
+        thread.post(workdir_mod.error_message(project.name, str(exc), options))
+        return
+
+    label = workdir_mod.relative_label(project.working_directory, target)
+    ctx.workdirs.set(thread.channel_id, thread.thread_ts, project.key, label)
+    logger.info(
+        "作業階層を変更しました project=%s thread_ts=%s workdir=%s",
+        project.key,
+        thread.thread_ts,
+        label or "(直下)",
+    )
+    thread.post(workdir_mod.changed_message(project.name, label))
+
+
+def _list_workdir(ctx: BridgeContext, thread: Thread, project, requested: str) -> None:
+    """``ls`` を処理する。Claude は起動しない。
+
+    引数が無ければ現在の作業階層を見る。``cd:`` の移動先を知るために要るので、
+    ``cd:`` と同じ境界（プロジェクト配下のみ）を通す。
+    """
+    current = ctx.workdirs.get(thread.channel_id, thread.thread_ts)
+    base = requested or current
+    try:
+        target = workdir_mod.resolve(project.working_directory, base)
+    except workdir_mod.WorkdirError as exc:
+        options = workdir_mod.candidates(project.working_directory)
+        thread.post(workdir_mod.error_message(project.name, str(exc), options))
+        return
+
+    label = workdir_mod.relative_label(project.working_directory, target)
+    dirs, files, omitted = workdir_mod.listing(target)
+    logger.info(
+        "階層の一覧を返しました project=%s thread_ts=%s workdir=%s dirs=%d files=%d",
+        project.key,
+        thread.thread_ts,
+        label or "(直下)",
+        len(dirs),
+        len(files),
+    )
+    thread.post_long(
+        workdir_mod.listing_message(
+            project.name,
+            label,
+            dirs,
+            files,
+            omitted,
+            has_rules=(target / ".claude").is_dir(),
+        )
     )
