@@ -255,6 +255,76 @@ git リポジトリでないプロジェクトでも実装モードで実行す�
 ただし差分の記録も自動コミットも行わないため、**変更を取り消す手段が無い**。
 安全網が要るなら対象ディレクトリで `git init` すれば、以降は自動コミットの対象になる。
 
+## 作業階層（`cd:`）
+
+Claude Code は起動した場所から `.claude/` を探す。プロジェクト内に開発ルールが複数
+階層あると、どこで起動するかで読まれる CLAUDE.md と skills が変わる。
+
+```text
+propose/
+├── .claude/CLAUDE.md, skills/
+└── movie/
+    └── .claude/CLAUDE.md, skills/
+```
+
+```text
+@ClaudeCode
+cd: movie
+```
+
+キーワードは `cd:` / `dir:` / `/cd:` / `階層:` / `移動:`。引数なしで現在の階層と
+`.claude/` を持つ階層の一覧を返し、`cd: .` で直下に戻す。**スレッド単位で持続**し、
+`state/workdirs.json` に記録するのでブリッジを再起動しても残る。
+
+`共有:` と同じくブリッジが直接処理するため、Claude Code は起動しない。
+
+### プロジェクト配下に限る
+
+`..`・絶対パス・存在しない階層・ファイルは拒否する。resolve 後にもう一度境界を
+確認しているので、シンボリックリンク経由でも外へ出られない。
+
+ここに Slack からの入力がそのまま通ると、`config/projects.yaml` による範囲指定の
+歯止めが効かなくなる（CLAUDE.md §15 の「未登録チャンネルでは実行しない」と同じ趣旨）。
+
+### git はリポジトリルートで動かす
+
+`git status --porcelain` は**リポジトリルート基準**でパスを返すのに、`git add` の
+パススペックは**cwd 基準**で解釈される。サブディレクトリで git を動かすと
+
+```
+$ cd sub && git status --porcelain -uall
+?? sub/b.txt
+$ git add -- sub/b.txt
+fatal: pathspec 'sub/b.txt' did not match any files
+```
+
+となって自動コミットが必ず失敗する。そのため `git_ops.repo_root()` でルートを求め、
+git の操作と git 由来のパスの解決はすべてそこを基準にする。**「Claude が動く場所」と
+「git が動く場所」は別物**として扱う。
+
+プロジェクト直下とリポジトリルートが一致しない場合にも、これで噛み合う。
+
+### セッションは階層ごとに分かれる
+
+Claude Code のセッションは作業ディレクトリ単位で保存される。
+
+```text
+C--Users-yutob-work-env-business-contest                    → 4 セッション
+C--Users-yutob-work-env-business-contest-BusinessStrategist → 3 セッション
+```
+
+階層を変えたのに同じ `session_id` を `--resume` しようとすると見つからず、文脈が
+切れる。そこで `derive_session_id` の導出に階層を混ぜ、階層ごとに別の id にしている。
+行って戻ってくればそれぞれの会話が続く。直下のときは従来と同じ id になるので、
+既存スレッドの継続は壊れない。
+
+### `_share/` と `_inbox/` は動かさない
+
+階層を変えてもプロジェクト直下に置く。階層ごとに散ると `共有: 1` の番号と実体の
+対応が追えなくなるため。下の階層で動いている Claude には `../_share/` のような
+相対パスで伝える（素の `_share/` と伝えると Claude は自分の cwd の下に作ってしまい、
+添付されない）。
+
 ## 出力ファイルの共有
 
 Slack から依頼した場合、生成物は自宅PCの中にあるのでスマホからは見えない。

@@ -49,13 +49,14 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
             continued=task.continued,
             implement=task.implement,
             model=task.model or settings.runtime.model,
+            workdir=task.workdir_label,
         ),
         interval=settings.runtime.progress_interval_seconds,
     )
     reporter.start()
 
     session_id = (
-        derive_session_id(task.channel_id, task.thread_ts)
+        derive_session_id(task.channel_id, task.thread_ts, task.workdir_label)
         if settings.runtime.session_continuation
         else None
     )
@@ -66,7 +67,8 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
             before = _snapshot(task)
             result = claude_runner.run(
                 prompt=file_flow.build_prompt(task),
-                working_directory=project.working_directory,
+                # Claude はここで起動する。cd: で選ばれた階層の .claude/ が読まれる。
+                working_directory=task.working_directory,
                 profile=settings.profiles[task.profile_key],
                 runtime=settings.runtime,
                 session_id=session_id,
@@ -88,7 +90,9 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
 
     if session_id:
         # 成功したときだけ記録する。失敗した実行を継続対象にしても意味がないため。
-        ctx.sessions.record(task.channel_id, task.thread_ts, session_id, project.key)
+        ctx.sessions.record(
+            task.channel_id, task.thread_ts, session_id, project.key, task.workdir_label
+        )
 
     elapsed = reporter.finish(
         formatting.completed_header(
@@ -97,6 +101,7 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
             result.cost_usd,
             result.num_turns,
             model=task.model or settings.runtime.model,
+            workdir=task.workdir_label,
         )
     )
     logger.info(
@@ -116,7 +121,7 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
     pushed_sha = None
     produced: list[str] = []
     if task.implement and before.head is not None:
-        commit_text, pushed_sha, produced = _commit_and_report(task, before.head)
+        commit_text, pushed_sha, produced = _commit_and_report(task, before)
         body += commit_text
     elif task.implement and before.files is not None:
         produced = artifacts.changed_since(
@@ -130,7 +135,7 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
 
     # 残りは一覧だけ出す。中身は送らず、番号で取り出せるようにする。
     _, rest = share_queue.split_shared(produced)
-    file_flow.report_outputs(thread, ctx.outputs, project, rest)
+    file_flow.report_outputs(thread, ctx.outputs, project, rest, base=before.repo)
 
     # CI は分単位でかかるので、結果を待たずにここで応答を返し、完了後に追って投稿する。
     # ワーカーを占有しないよう専用スレッドで待つ（max_workers=1 でも他の依頼が詰まらない）。
@@ -146,15 +151,20 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
 class _Before:
     """実行前の状態。``head`` は git のスナップショット、``files`` は mtime 走査。
 
-    git 管理下なら ``head`` だけ、管理外なら ``files`` だけが入る。どちらも
+    git 管理下なら ``head`` と ``repo``、管理外なら ``files`` だけが入る。どちらも
     調査モードでは取らない（書き込めないので比較する意味が無い）。
+
+    ``repo`` を持つのが要点。``git status --porcelain`` はリポジトリルート基準で
+    パスを返すので、そのパスを解決する基準も同じルートでなければならない。
+    プロジェクト直下とリポジトリルートは一致しないことがある。
     """
 
-    __slots__ = ("head", "files")
+    __slots__ = ("head", "files", "repo")
 
-    def __init__(self, head, files) -> None:
+    def __init__(self, head, files, repo=None) -> None:
         self.head = head
         self.files = files
+        self.repo = repo
 
 
 def _snapshot(task: TaskRequest) -> _Before:
@@ -164,18 +174,20 @@ def _snapshot(task: TaskRequest) -> _Before:
     commit 処理ごと飛ぶので、未管理ディレクトリでも実行はできる（ただし変更の
     自動 commit も差分報告も行われない）。その代わり mtime で出力を検出し、
     「何が出力されたか」を一覧に出すところまでは同じように動かす。
+
+    mtime 走査はプロジェクト直下から行う。``cd:`` で下の階層にいても、その外に
+    出力されたファイルを見落としたくないため。
     """
-    cwd = task.project.working_directory
+    root = task.project.working_directory
     if not task.implement:
         return _Before(None, None)
-    if git_ops.is_repo(cwd):
-        return _Before(git_ops.snapshot(cwd), None)
-    return _Before(None, artifacts.scan(cwd))
+    repo = git_ops.repo_root(root)
+    if repo is not None:
+        return _Before(git_ops.snapshot(repo), None, repo)
+    return _Before(None, artifacts.scan(root))
 
 
-def _commit_and_report(
-    task: TaskRequest, before: git_ops.Snapshot
-) -> tuple[str, str | None, list[str]]:
+def _commit_and_report(task: TaskRequest, before: "_Before") -> tuple[str, str | None, list[str]]:
     """この実行で変わったファイルを commit し、報告文を組み立てる（CLAUDE.md §21）。
 
     返り値の3つめは、この実行で変わったファイルの一覧。Slack への共有候補として
@@ -183,9 +195,11 @@ def _commit_and_report(
     ファイル自体は作業ツリーに残っているので、受け渡しはできるため。
     """
     project = task.project
-    cwd = project.working_directory
+    # git は必ずリポジトリルートで動かす。cd: で下の階層にいても、porcelain が返す
+    # パスはルート基準なので、add / commit も同じ基準でなければ噛み合わない。
+    cwd = before.repo
     try:
-        changed, preexisting = git_ops.changed_since(cwd, before)
+        changed, preexisting = git_ops.changed_since(cwd, before.head)
         # _share/ は Slack への転送用の置き場であってプロジェクトの成果物ではない。
         # commit するとリポジトリが共有ファイルで汚れるので、ここで外す。
         _, changed = share_queue.split_shared(changed)

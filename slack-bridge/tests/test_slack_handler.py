@@ -15,6 +15,7 @@
 """
 
 import dataclasses
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -102,16 +103,39 @@ def settings(tmp_path, project_dir):
             "investigate": PermissionProfile(key="investigate", tools=["Read"]),
         },
         runtime=Runtime(
+            # 記録ファイルは必ず tmp_path に向ける。既定のままだと本物の
+            # state/ を書き換えてしまい、テスト間で状態が漏れる（実際に漏れた）。
             session_store_path=tmp_path / "sessions.json",
             artifact_store_path=tmp_path / "artifacts.json",
+            workdir_store_path=tmp_path / "workdirs.json",
             progress_interval_seconds=0,  # 進捗スレッドを起こさない
         ),
     )
 
 
+class SyncExecutor:
+    """``submit`` をその場で実行する差し替え用の executor。
+
+    テストを決定的にするため。本物のスレッドプールだと完了待ちが必要で、
+    待ち方を間違えると「まだ動いている途中」を検証してしまう。
+    並行性そのものを見るテスト（直列化）は本物を使うので、ここは
+    ``dispatch`` を使うテストにだけ効かせる。
+    """
+
+    def __init__(self, **kwargs) -> None:
+        pass
+
+    def submit(self, fn, *args, **kwargs):
+        fn(*args, **kwargs)
+
+    def shutdown(self, wait: bool = True) -> None:
+        pass
+
+
 @pytest.fixture
-def dispatch(settings):
-    """``app_mention`` ハンドラを呼び、ワーカーの完了まで待つ関数を返す。"""
+def dispatch(settings, monkeypatch):
+    """``app_mention`` ハンドラを呼ぶ関数を返す。ワーカーは同期実行される。"""
+    monkeypatch.setattr(slack_handler, "ThreadPoolExecutor", SyncExecutor)
     app = slack_handler.create_app(settings)
     handler = app._listeners[0].ack_function
 
@@ -126,8 +150,6 @@ def dispatch(settings):
             },
             client=client,
         )
-        # executor.submit したタスクを取り切ってから検証する
-        app._slack_bridge_executor.shutdown(wait=True)
 
     return _dispatch
 
@@ -391,3 +413,155 @@ def test_same_thread_requests_are_serialised(settings, monkeypatch):
     app._slack_bridge_executor.shutdown(wait=True)
 
     assert not any(overlapping)
+
+# --------------------------------------------------------------------------
+# 作業階層（cd:）
+#
+# Claude Code は起動時の cwd から .claude/ を探すので、どこで起動するかで
+# 読まれる CLAUDE.md と skills が変わる。cd: がそれを切り替えられること、
+# そして切り替えても git とファイル受け渡しが噛み合うことを確かめる。
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def nested(project_dir):
+    """propose と同じ形。直下と movie に .claude を持つ。"""
+    (project_dir / ".claude").mkdir()
+    (project_dir / "movie" / ".claude").mkdir(parents=True)
+    return project_dir
+
+
+def test_cd_changes_where_claude_runs(dispatch, ran, nested):
+    client = FakeClient()
+    dispatch(client, text="cd: movie")
+    assert ran == []                                  # Claude は起動しない
+    assert client.said("movie")
+
+    dispatch(FakeClient(), text="やって", event_id="Ev2")
+    assert ran[0]["working_directory"] == (nested / "movie").resolve()
+
+
+def test_default_runs_at_the_project_root(dispatch, ran, nested):
+    dispatch(FakeClient(), text="やって")
+    assert ran[0]["working_directory"] == nested
+
+
+def test_cd_persists_across_requests_in_the_thread(dispatch, ran, nested):
+    dispatch(FakeClient(), text="cd: movie")
+    dispatch(FakeClient(), text="1回目", event_id="Ev2")
+    dispatch(FakeClient(), text="2回目", event_id="Ev3")
+
+    assert [r["working_directory"] for r in ran] == [(nested / "movie").resolve()] * 2
+
+
+def test_cd_back_to_root(dispatch, ran, nested):
+    dispatch(FakeClient(), text="cd: movie")
+    dispatch(FakeClient(), text="cd: .", event_id="Ev2")
+    dispatch(FakeClient(), text="やって", event_id="Ev3")
+
+    assert ran[0]["working_directory"] == nested
+
+
+def test_cd_outside_the_project_is_refused(dispatch, ran, nested):
+    client = FakeClient()
+    dispatch(client, text="cd: ../../etc")
+
+    assert client.said("外へは移動できません")
+    dispatch(FakeClient(), text="やって", event_id="Ev2")
+    assert ran[0]["working_directory"] == nested      # 階層は変わっていない
+
+
+def test_cd_to_missing_directory_suggests_candidates(dispatch, ran, nested):
+    client = FakeClient()
+    dispatch(client, text="cd: movei")                # 打ち間違い
+
+    assert client.said("ありません")
+    assert client.said("movie")                       # .claude を持つ階層を案内
+
+
+def test_cd_without_argument_reports_current(dispatch, ran, nested):
+    dispatch(FakeClient(), text="cd: movie")
+    client = FakeClient()
+    dispatch(client, text="cd:", event_id="Ev2")
+
+    assert client.said("movie")
+    assert ran == []
+
+
+def test_start_message_shows_the_workdir(dispatch, ran, nested):
+    dispatch(FakeClient(), text="cd: movie")
+    client = FakeClient()
+    dispatch(client, text="やって", event_id="Ev2")
+
+    assert client.said("movie/")                      # どこで動いているか分かる
+
+
+def test_share_dir_note_is_relative_to_the_workdir(dispatch, ran, nested):
+    # _share/ はプロジェクト直下に固定なので、下の階層からは ../_share/
+    dispatch(FakeClient(), text="cd: movie")
+    dispatch(FakeClient(), text="やって", event_id="Ev2")
+
+    assert "../_share/" in ran[0]["prompt"]
+
+
+def test_share_dir_stays_at_the_project_root(dispatch, ran, nested):
+    # 下の階層で動いていても、プロジェクト直下の _share/ から送る
+    share = nested / "_share"
+    share.mkdir()
+    (share / "out.md").write_text("成果物", encoding="utf-8")
+
+    dispatch(FakeClient(), text="cd: movie")
+    client = FakeClient()
+    dispatch(client, text="やって", event_id="Ev2")
+
+    assert [u["title"] for u in client.uploads] == ["_share/out.md"]
+
+
+def test_sessions_are_separate_per_workdir(dispatch, ran, nested):
+    """階層ごとに別セッションになる。
+
+    Claude Code のセッションは作業ディレクトリ単位で保存されるので、階層を
+    変えたのに同じ session_id を resume しようとすると見つからず、文脈が切れる。
+    """
+    dispatch(FakeClient(), text="1回目")                            # 直下
+    dispatch(FakeClient(), text="cd: movie", event_id="Ev2")
+    dispatch(FakeClient(), text="2回目", event_id="Ev3")             # movie
+
+    root_session, movie_session = ran[0]["session_id"], ran[1]["session_id"]
+    assert root_session != movie_session
+    assert ran[1]["resume"] is False                                 # movie では新規
+
+
+def test_returning_to_a_workdir_resumes_its_own_session(dispatch, ran, nested):
+    dispatch(FakeClient(), text="1回目")                             # 直下で開始
+    dispatch(FakeClient(), text="cd: movie", event_id="Ev2")
+    dispatch(FakeClient(), text="movie で", event_id="Ev3")
+    dispatch(FakeClient(), text="cd: .", event_id="Ev4")
+    dispatch(FakeClient(), text="直下に戻って", event_id="Ev5")
+
+    assert ran[2]["session_id"] == ran[0]["session_id"]              # 同じ会話へ戻る
+    assert ran[2]["resume"] is True
+
+
+def test_commit_works_from_a_subdirectory(dispatch, ran, nested):
+    """サブディレクトリからでも自動コミットが通る。
+
+    git status --porcelain はリポジトリルート基準でパスを返すのに、git add の
+    パススペックは cwd 基準で解釈される。サブディレクトリで git を動かすと
+    `fatal: pathspec ... did not match any files` で必ず失敗するため、
+    git はリポジトリルートで動かしている。その回帰を防ぐ。
+    """
+    subprocess.run(["git", "init", "-q", "."], cwd=nested, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "init", "--allow-empty"], cwd=nested, check=True)
+
+    dispatch(FakeClient(), text="cd: movie")
+    ran.writes.append(("movie/new.py", "print(1)"))
+    client = FakeClient()
+    dispatch(client, text="作って", event_id="Ev2")
+
+    committed = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"],
+        cwd=nested, capture_output=True, text=True, check=True,
+    ).stdout
+    assert "movie/new.py" in committed
+    assert not client.said("did not match any files")

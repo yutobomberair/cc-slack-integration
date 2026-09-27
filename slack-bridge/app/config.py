@@ -63,6 +63,8 @@ class Runtime:
     session_store_path: Path = BASE_DIR / "state" / "sessions.json"
     # _share/sent/ に退避した送信済みファイルを保持する日数。0 で送信後すぐ削除。
     share_retention_days: int = 7
+    # スレッドごとの作業階層（cd:）。プロジェクト配下の相対表記を持つ。
+    workdir_store_path: Path = BASE_DIR / "state" / "workdirs.json"
     # 出力ファイルの一覧（スレッド -> パス）。共有の番号を解決するために使う。
     artifact_store_path: Path = BASE_DIR / "state" / "artifacts.json"
     # 実行中の経過表示を chat.update で更新する間隔（秒）。0 で無効。
@@ -232,6 +234,7 @@ def _parse_runtime(raw: dict) -> Runtime:
         session_continuation=bool(raw.get("session_continuation", True)),
         session_store_path=(Path(store) if store else BASE_DIR / "state" / "sessions.json"),
         share_retention_days=int(raw.get("share_retention_days", 7)),
+        workdir_store_path=BASE_DIR / "state" / "workdirs.json",
         artifact_store_path=BASE_DIR / "state" / "artifacts.json",
         progress_interval_seconds=float(raw.get("progress_interval_seconds") or 30.0),
         strict_mcp_config=bool(raw.get("strict_mcp_config", True)),

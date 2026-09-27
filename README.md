@@ -48,12 +48,47 @@ Slack の Events API は使わず **Socket Mode** で繋ぐ。自宅 PC に公�
 | `haiku:` `opus:` | モデルを指定（`allowed_models` にある名前だけ） |
 | `調査 haiku:` | 併用可。順番は問わない |
 | `共有: 1` | 出力ファイルを番号で受け取る |
+| `cd: movie` | 作業階層を変える（後述） |
 
 スレッドは Claude Code のセッションに紐づく。同じスレッドで続けて話せば文脈が残る。
 
 ```
 @ClaudeCode さっきの調査の続きで、移行手順だけ詳しく出して
 ```
+
+## 作業階層を選ぶ
+
+Claude Code は**起動した場所から `.claude/` を探す**ので、プロジェクト内に開発ルールが
+複数階層あると、どこで起動するかで読まれる CLAUDE.md と skills が変わる。
+
+```
+propose/
+├── .claude/CLAUDE.md, skills/      ← propose で起動すると読まれる
+└── movie/
+    └── .claude/CLAUDE.md, skills/  ← propose/movie で起動すると読まれる
+```
+
+`cd:` でその階層を選ぶ。**スレッド単位で持続**するので、一度指定すれば以降の依頼は
+そこで実行される。
+
+```
+@ClaudeCode cd: movie     → このスレッドは propose/movie で実行
+@ClaudeCode cd:           → 現在の階層と、開発ルールがある階層の一覧
+@ClaudeCode cd: .         → プロジェクト直下に戻す
+```
+
+どこで動いているかは毎回の返信に出る。
+
+```
+⏳ 処理を開始しました。
+Project: propose / 📁 movie/ / ✏️ 実装モード
+```
+
+**プロジェクト配下に限る。** `..` や絶対パスは弾く。ここに Slack からの入力が
+そのまま通ると、`config/projects.yaml` による範囲指定の歯止めが効かなくなる。
+
+階層ごとに Claude Code のセッションが分かれる（セッションは作業ディレクトリ単位で
+保存されるため）。行って戻ってくれば、それぞれの会話が続く。
 
 ## ファイルの受け渡し
 
@@ -79,11 +114,16 @@ Claude に Slack のトークンを触らせずに済ませるための出口で
 **渡す** — メンションにファイルを添付すると `_inbox/` へ降り、置き場所が Claude に
 伝わる。スマホで撮った資料をそのまま投げて「これを元に整理して」と頼める。
 
+`_share/` と `_inbox/` は `cd:` で階層を変えても**常にプロジェクト直下**に置く。
+階層ごとに散ると `共有: 1` の番号と実体の対応が追えなくなるため。下の階層で動いて
+いる Claude には `../_share/` のような相対パスで伝える。
+
 ## できること
 
 | | |
 |---|---|
 | チャンネル → プロジェクトのルーティング | `channel_id` で判定。チャンネル名の変更で壊れない |
+| 作業階層の切り替え | `cd:` でプロジェクト配下の階層を選ぶ。階層ごとの CLAUDE.md と skills が効く |
 | 未登録チャンネルの拒否 | 知らないチャンネルでは Claude Code を起動しない |
 | 権限プロファイル | プロジェクトごとに許可ツールを切り替え |
 | セッション継続 | Slack スレッド = Claude Code セッション |
@@ -114,6 +154,7 @@ slack-bridge/app/
 ├── claude_runner.py   claude CLI の起動と JSON 解析
 ├── task.py            BridgeContext / TaskRequest
 ├── task_mode.py       依頼文先頭のディレクティブ解釈
+├── workdir.py         スレッドごとの作業階層（cd:）
 ├── artifacts.py       出力ファイルの検出・一覧・受け渡し
 ├── share_queue.py     _share/ 送信待ち行列
 ├── inbox.py           Slack 添付の受け取り
@@ -138,7 +179,7 @@ slack-bridge/app/
 
 ```bash
 cd slack-bridge
-./venv/Scripts/python.exe -m pytest tests/ -q     # 261 件
+./venv/Scripts/python.exe -m pytest tests/ -q     # 320 件
 ./venv/Scripts/python.exe -m ruff check app/ tests/ --select F
 ```
 

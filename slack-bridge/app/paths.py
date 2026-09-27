@@ -24,3 +24,14 @@ def unique_path(target: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise OSError(f"{target.name} の置き場所を確保できませんでした")
+
+
+def relative_prefix(workdir_label: str) -> str:
+    """プロジェクト直下を、``workdir_label`` の階層から見たときの相対接頭辞。
+
+    ``_share/`` と ``_inbox/`` はプロジェクト直下に固定なので、Claude が下の階層で
+    動いているときはその分だけ遡る必要がある。``movie`` なら ``../``、
+    ``a/b`` なら ``../../``。直下にいるときは空文字。
+    """
+    depth = len([part for part in (workdir_label or "").split("/") if part])
+    return "../" * depth

@@ -24,7 +24,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.paths import unique_path
+from app.paths import relative_prefix, unique_path
 
 logger = logging.getLogger(__name__)
 
@@ -139,16 +139,21 @@ def save_files(files: list[dict], cwd: Path, token: str) -> list[Saved]:
     return saved
 
 
-def prompt_note(saved: list[Saved]) -> str:
+def prompt_note(saved: list[Saved], workdir_label: str = "") -> str:
     """Claude へ「どこに置いたか」を伝える一文。
 
     保存しただけでは Claude はファイルの存在を知らないので、依頼文の前に付ける。
+
+    ``workdir_label`` は Claude が動く階層（プロジェクト直下からの相対表記）。
+    ``_inbox/`` はプロジェクト直下にあるので、下の階層で動いているときは
+    そこから見た相対パス（``../_inbox/...``）で伝える。
     """
     ok = [s for s in saved if s.ok]
     if not ok:
         return ""
+    prefix = relative_prefix(workdir_label)
     lines = ["[Slack に添付されたファイルを次の場所へ保存しました]"]
-    lines.extend(f"- {s.path}" for s in ok)
+    lines.extend(f"- {prefix}{s.path}" for s in ok)
     return "\n".join(lines) + "\n\n"
 
 
