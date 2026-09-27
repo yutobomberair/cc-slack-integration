@@ -1,0 +1,263 @@
+"""``claude-usage`` の入口（仕様書 §8, §9, §10）。
+
+    claude-usage              要点とペース判定
+    claude-usage status       詳細（Confidence 付き）
+    claude-usage --json       機械可読
+
+値は statusline スクリプトが記録したスナップショットから読む。**こちらから取りに
+行く手段が無い**ので、Claude Code を使っていない間は更新されない。だから
+**最終更新時刻を必ず出す**。古い値を現在値として見せないため。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import datetime, timezone
+
+from claude_usage import display, pace
+from claude_usage import snapshot as snap
+from claude_usage.snapshot import Snapshot, Window
+
+#: 何分より古いスナップショットを「古い」と言うか。
+STALE_MINUTES = 10
+
+_LEVEL_MARK = {
+    "ok": ("✓", "OK"),
+    "underuse": ("○", "--"),
+    "warning": ("⚠", "!!"),
+    "critical": ("✕", "XX"),
+    "unknown": ("?", "?"),
+}
+
+
+def _mark(level: str) -> str:
+    preferred, fallback = _LEVEL_MARK.get(level, ("?", "?"))
+    return display.pick(preferred, fallback)
+
+
+def _age_line(shot: Snapshot, now: datetime) -> str:
+    """最終更新。古ければそれを明示する。"""
+    age = (now - shot.captured_datetime).total_seconds()
+    stamp = shot.captured_datetime.astimezone().strftime("%H:%M:%S")
+    if age < 60:
+        return f"Updated: {stamp}"
+    minutes = int(age // 60)
+    if minutes < STALE_MINUTES:
+        return f"Updated: {stamp}（{minutes} 分前）"
+    if minutes < 1440:
+        return f"Updated: {stamp}（{minutes} 分前 — Claude Code 未使用中の値です）"
+    days = minutes // 1440
+    return f"Updated: {stamp}（{days} 日前 — 古い値です）"
+
+
+def _window_block(title: str, window: Window, now: datetime) -> list[str]:
+    if not window.available:
+        # 仕様書 §20。取れない値を推測して埋めない。
+        return [f"{title}", "  Unavailable", ""]
+    lines = [
+        title,
+        f"  {display.bar(window.used_percent)} {window.used_percent:.0f}%",
+        f"  Remaining: {window.remaining_percent:.0f}%",
+    ]
+    reset = window.reset_datetime
+    if reset:
+        seconds = window.seconds_until_reset(now) or 0
+        lines.append(
+            f"  Reset: {reset.astimezone():%m-%d %H:%M}（あと {seconds / 3600:.1f} 時間）"
+        )
+    lines.append("")
+    return lines
+
+
+def render_summary(shot: Snapshot, history: list[Snapshot], now: datetime) -> str:
+    five = pace.five_hour_verdict(shot, history, now)
+    seven = pace.seven_day_verdict(shot, history, now)
+    summary = pace.overall([five, seven])
+
+    lines = ["Claude Code Usage", "-" * 40, ""]
+    if shot.model:
+        lines += ["Model", f"  {shot.model}", ""]
+    lines += _window_block("5-hour window", shot.five_hour, now)
+    lines += _window_block("7-day window", shot.seven_day, now)
+    if shot.spend_limit.available:
+        lines += _window_block("Spend limit", shot.spend_limit, now)
+
+    lines += ["Pace"]
+    for verdict in (five, seven):
+        if verdict.level == "unknown":
+            continue
+        lines.append(f"  {_mark(verdict.level)} {verdict.headline}")
+        if verdict.detail:
+            lines.append(f"    {verdict.detail}")
+    lines += ["", "-" * 40, f"{_mark(summary.level)} {summary.headline}", _age_line(shot, now)]
+    return "\n".join(lines)
+
+
+def render_status(shot: Snapshot, history: list[Snapshot], now: datetime) -> str:
+    """詳細表示。値ごとに Confidence を出す（仕様書 §5, §9）。"""
+    five = pace.five_hour_verdict(shot, history, now)
+    seven = pace.seven_day_verdict(shot, history, now)
+    five_burn = pace.burn(history, "five_hour", now)
+    seven_burn = pace.burn(history, "seven_day", now)
+
+    lines = ["Claude Code Usage", "-" * 40, ""]
+
+    for title, window, measured in (
+        ("5h Window", shot.five_hour, five_burn),
+        ("7-day Window", shot.seven_day, seven_burn),
+    ):
+        lines.append(title)
+        if not window.available:
+            lines += ["  Used       : Unavailable", "  Source     : unavailable", ""]
+            continue
+        lines.append(f"  Used       : {window.used_percent:.0f}%")
+        lines.append(f"  Remaining  : {window.remaining_percent:.0f}%")
+        if window.reset_datetime:
+            lines.append(f"  Reset      : {window.reset_datetime.astimezone():%Y-%m-%d %H:%M}")
+        lines.append("  Source     : official")
+        if measured.measured:
+            lines.append(f"  Burn       : {measured.percent_per_hour:.2f}%/時（estimated）")
+            if measured.exhausts_at:
+                lines.append(
+                    f"  Exhausts   : {measured.exhausts_at.astimezone():%m-%d %H:%M}"
+                    "（estimated）"
+                )
+        else:
+            lines.append("  Burn       : 計測待ち（スナップショットが2点必要）")
+        lines.append("")
+
+    lines += ["Daily", "  Unavailable", "  Source     : unavailable",
+              "  （Claude Code に日次制限は無い。5時間枠と7日枠で管理する）", ""]
+
+    lines += ["Current Session"]
+    lines.append(f"  Model      : {shot.model or '不明'}")
+    if shot.context_used_percent is not None:
+        lines.append(f"  Context    : {shot.context_used_percent:.0f}%")
+    if shot.input_tokens is not None:
+        lines.append(f"  Input      : {shot.input_tokens:,}")
+    if shot.output_tokens is not None:
+        lines.append(f"  Output     : {shot.output_tokens:,}")
+    if shot.session_cost_usd is not None:
+        lines.append(f"  Cost       : ${shot.session_cost_usd:.2f}")
+    lines.append("  （Context は利用枠とは別の指標）")
+    lines.append("")
+
+    lines += ["Pace"]
+    for verdict in (five, seven):
+        lines.append(f"  {_mark(verdict.level)} {verdict.headline}")
+        if verdict.detail:
+            lines.append(f"    {verdict.detail}")
+    lines += ["", f"Snapshots  : {len(history)} 件", _age_line(shot, now)]
+    return "\n".join(lines)
+
+
+def build_json(shot: Snapshot, history: list[Snapshot], now: datetime) -> dict:
+    """仕様書 §10 の形。取れない値は null にし、confidence で区別する。"""
+
+    def block(window: Window, measured: pace.Burn) -> dict:
+        if not window.available:
+            return {
+                "used_percent": None,
+                "remaining_percent": None,
+                "reset_at": None,
+                "confidence": "unavailable",
+            }
+        return {
+            "used_percent": window.used_percent,
+            "remaining_percent": window.remaining_percent,
+            "reset_at": window.reset_datetime.isoformat() if window.reset_datetime else None,
+            "confidence": "official",
+            "burn_percent_per_hour": measured.percent_per_hour,
+            "exhausts_at": measured.exhausts_at.isoformat() if measured.exhausts_at else None,
+            "burn_confidence": "estimated" if measured.measured else "unavailable",
+        }
+
+    five = pace.five_hour_verdict(shot, history, now)
+    seven = pace.seven_day_verdict(shot, history, now)
+    return {
+        "timestamp": now.astimezone().isoformat(timespec="seconds"),
+        "captured_at": shot.captured_datetime.astimezone().isoformat(timespec="seconds"),
+        "stale": (now - shot.captured_datetime).total_seconds() > STALE_MINUTES * 60,
+        "subscription": {
+            "five_hour": block(shot.five_hour, pace.burn(history, "five_hour", now)),
+            "seven_day": block(shot.seven_day, pace.burn(history, "seven_day", now)),
+            "daily": {
+                "used_percent": None,
+                "remaining_percent": None,
+                "reset_at": None,
+                "confidence": "unavailable",
+                "note": "Claude Code に日次制限は存在しない",
+            },
+        },
+        "session": {
+            "model": shot.model,
+            "context_used_percent": shot.context_used_percent,
+            "input_tokens": shot.input_tokens,
+            "output_tokens": shot.output_tokens,
+            "cost_usd": shot.session_cost_usd,
+            "session_id": shot.session_id,
+            "project_dir": shot.project_dir,
+        },
+        "pace": {
+            "five_hour": {"level": five.level, "message": five.headline, "detail": five.detail},
+            "seven_day": {"level": seven.level, "message": seven.headline, "detail": seven.detail},
+            "overall": pace.overall([five, seven]).level,
+        },
+        "snapshots": len(history),
+    }
+
+
+_NO_DATA = """スナップショットがまだありません。
+
+statusline を設定すると、Claude Code が起動するたびに記録されます。
+
+  ~/.claude/settings.json
+  "statusLine": {
+    "type": "command",
+    "command": "python -m claude_usage.statusline"
+  }
+
+利用枠の値は statusline の stdin にしか流れてこないため、こちらから取りに行く
+手段がありません（詳細は .claude/doc/claude_code_usage_monitor_findings.md）。"""
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="claude-usage", description="Claude Code の利用枠を監視する"
+    )
+    parser.add_argument(
+        "command", nargs="?", default="summary", choices=["summary", "status"]
+    )
+    parser.add_argument("--json", action="store_true", help="JSON で出力する")
+    args = parser.parse_args(argv)
+
+    shot = snap.load_latest()
+    if shot is None:
+        if args.json:
+            print(json.dumps({"error": "no_snapshot"}, ensure_ascii=False))
+        else:
+            display.write_line(_NO_DATA)
+        return 1
+
+    history = snap.load_history()
+    now = datetime.now(timezone.utc)
+
+    if args.json:
+        print(json.dumps(build_json(shot, history, now), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "status":
+        display.write_line(render_status(shot, history, now))
+    else:
+        display.write_line(render_summary(shot, history, now))
+
+    # ペースに問題があれば終了コードで知らせる（cron や他ツールから使えるように）
+    summary = pace.overall(
+        [pace.five_hour_verdict(shot, history, now), pace.seven_day_verdict(shot, history, now)]
+    )
+    return 2 if summary.is_problem else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
