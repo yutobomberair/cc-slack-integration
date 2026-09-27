@@ -527,3 +527,310 @@ def test_held_lock_skips_the_history_but_keeps_latest():
     snap.save(shot(five=(10.0, NOW + timedelta(hours=3)), model="Opus 5"))
     assert snap.load_latest().model == "Opus 5"       # 最新値は残る
     assert snap.load_history() == []                  # 履歴は落ちる
+
+
+# --------------------------------------------------------------------------
+# アラート（仕様書 §11）
+#
+# statusline は常に呼ばれているので、素朴に閾値を見ると毎回鳴る。
+# 「同じことを鳴らし続けない」が本体なので、そこを厚く見る。
+# --------------------------------------------------------------------------
+
+from claude_usage import alerts as alerts_mod  # noqa: E402
+from claude_usage import config as config_mod  # noqa: E402
+from claude_usage import notifiers  # noqa: E402
+
+DEFAULTS = config_mod.Config()
+
+
+@pytest.mark.parametrize(
+    "percent,level",
+    [(0, "none"), (69, "none"), (70, "warning"), (84, "warning"),
+     (85, "high"), (94, "high"), (95, "critical"), (100, "critical"), (None, "none")],
+)
+def test_threshold_levels(percent, level):
+    assert alerts_mod.threshold_level(percent, config_mod.Thresholds()) == level
+
+
+def test_no_alert_below_the_threshold():
+    current = shot(five=(50.0, NOW + timedelta(hours=3)))
+    assert alerts_mod.decide(current, [current], DEFAULTS, NOW) == []
+
+
+def test_threshold_alert_fires():
+    current = shot(five=(72.0, NOW + timedelta(hours=3)))
+    found = alerts_mod.decide(current, [current], DEFAULTS, NOW)
+    assert [a.level for a in found] == ["warning"]
+    assert "72%" in found[0].headline
+    assert "リセット" in found[0].detail       # いつ復活するかが要る
+
+
+def test_alerts_can_be_disabled():
+    current = shot(five=(99.0, NOW + timedelta(hours=3)))
+    disabled = config_mod.Config(alerts_enabled=False)
+    assert alerts_mod.decide(current, [current], disabled, NOW) == []
+
+
+def test_underuse_is_reported():
+    """目的の半分。余らせるのもよくない。"""
+    reset = NOW + timedelta(days=5)
+    current = shot(seven=(10.0, reset))
+    history = [shot(seven=(9.0, reset), at=NOW - timedelta(hours=10)), current]
+
+    found = alerts_mod.decide(current, history, DEFAULTS, NOW)
+    assert [a.level for a in found] == ["underuse"]
+
+
+def test_underuse_can_be_turned_off():
+    reset = NOW + timedelta(days=5)
+    current = shot(seven=(10.0, reset))
+    history = [shot(seven=(9.0, reset), at=NOW - timedelta(hours=10)), current]
+    quiet = config_mod.Config(thresholds=config_mod.Thresholds(underuse=False))
+
+    assert alerts_mod.decide(current, history, quiet, NOW) == []
+
+
+def test_one_alert_per_window_keeps_the_heavier():
+    """70%到達とペース警告を2通出すと読まれなくなる。"""
+    reset = NOW + timedelta(hours=3)
+    current = shot(five=(72.0, reset))
+    # 20%/時 で残り 28% → リセット前に尽きる（ペース側も warning）
+    history = [shot(five=(52.0, reset), at=NOW - timedelta(hours=1)), current]
+
+    found = alerts_mod.decide(current, history, DEFAULTS, NOW)
+    assert len(found) == 1
+
+
+def test_both_windows_can_alert():
+    five_reset = NOW + timedelta(hours=3)
+    seven_reset = NOW + timedelta(days=5)
+    current = shot(five=(72.0, five_reset), seven=(90.0, seven_reset))
+    found = alerts_mod.decide(current, [current], DEFAULTS, NOW)
+    assert {a.window for a in found} == {"five_hour", "seven_day"}
+
+
+# --- 重複の抑制 ---
+
+def test_the_same_level_does_not_fire_twice():
+    reset = NOW + timedelta(hours=3)
+    current = shot(five=(72.0, reset))
+    found = alerts_mod.decide(current, [current], DEFAULTS, NOW)
+
+    first, state = alerts_mod.filter_new(current, found, {})
+    assert len(first) == 1
+    second, _ = alerts_mod.filter_new(current, found, state)
+    assert second == []                     # statusline は何度も呼ばれる
+
+
+def test_rising_to_a_heavier_level_fires_again():
+    reset = NOW + timedelta(hours=3)
+    warned = shot(five=(72.0, reset))
+    _, state = alerts_mod.filter_new(
+        warned, alerts_mod.decide(warned, [warned], DEFAULTS, NOW), {}
+    )
+
+    worse = shot(five=(96.0, reset))
+    fresh, _ = alerts_mod.filter_new(
+        worse, alerts_mod.decide(worse, [worse], DEFAULTS, NOW), state
+    )
+    assert [a.level for a in fresh] == ["critical"]
+
+
+def test_dropping_back_does_not_fire():
+    reset = NOW + timedelta(hours=3)
+    worse = shot(five=(96.0, reset))
+    _, state = alerts_mod.filter_new(
+        worse, alerts_mod.decide(worse, [worse], DEFAULTS, NOW), {}
+    )
+
+    milder = shot(five=(72.0, reset))
+    fresh, _ = alerts_mod.filter_new(
+        milder, alerts_mod.decide(milder, [milder], DEFAULTS, NOW), state
+    )
+    assert fresh == []
+
+
+def test_a_new_window_fires_again():
+    """枠がリセットされたら鳴らし直す。でないと次の枠で警告が出ない。"""
+    old = shot(five=(72.0, NOW + timedelta(hours=1)))
+    _, state = alerts_mod.filter_new(
+        old, alerts_mod.decide(old, [old], DEFAULTS, NOW), {}
+    )
+
+    fresh_window = shot(five=(72.0, NOW + timedelta(hours=6)))   # resets_at が変わった
+    fresh, _ = alerts_mod.filter_new(
+        fresh_window, alerts_mod.decide(fresh_window, [fresh_window], DEFAULTS, NOW), state
+    )
+    assert [a.level for a in fresh] == ["warning"]
+
+
+def test_underuse_is_not_repeated_within_a_window():
+    reset = NOW + timedelta(days=5)
+    current = shot(seven=(10.0, reset))
+    history = [shot(seven=(9.0, reset), at=NOW - timedelta(hours=10)), current]
+    found = alerts_mod.decide(current, history, DEFAULTS, NOW)
+
+    first, state = alerts_mod.filter_new(current, found, {})
+    assert len(first) == 1
+    again, _ = alerts_mod.filter_new(current, found, state)
+    assert again == []
+
+
+def test_state_survives_a_restart():
+    reset = NOW + timedelta(hours=3)
+    current = shot(five=(72.0, reset))
+    _, state = alerts_mod.filter_new(
+        current, alerts_mod.decide(current, [current], DEFAULTS, NOW), {}
+    )
+    alerts_mod.save_state(state)
+
+    reloaded = alerts_mod.load_state()
+    fresh, _ = alerts_mod.filter_new(
+        current, alerts_mod.decide(current, [current], DEFAULTS, NOW), reloaded
+    )
+    assert fresh == []
+
+
+def test_corrupt_state_is_ignored():
+    alerts_mod.data_dir().mkdir(parents=True, exist_ok=True)
+    alerts_mod.state_path().write_text("{ broken", encoding="utf-8")
+    assert alerts_mod.load_state() == {}
+
+
+# --- 通知先 ---
+
+def test_file_notifier_keeps_a_record():
+    alert = alerts_mod.Alert("five_hour", "warning", "見出し", "詳細")
+    assert notifiers.notify_file(alert) is True
+    body = notifiers.log_path().read_text(encoding="utf-8")
+    assert "warning" in body and "見出し" in body
+
+
+def test_deliver_only_uses_enabled_notifiers():
+    alert = alerts_mod.Alert("five_hour", "warning", "見出し")
+    quiet = config_mod.Config(
+        notifiers=config_mod.Notifiers(terminal=False, file=True, windows=False, slack=False)
+    )
+    result = notifiers.deliver([alert], quiet)
+    assert result == {"terminal": 0, "file": 1, "windows": 0, "slack": 0}
+
+
+def test_slack_needs_a_channel_and_token():
+    alert = alerts_mod.Alert("five_hour", "warning", "見出し")
+    assert notifiers.notify_slack(alert, config_mod.Notifiers()) is False
+
+
+def test_slack_posts_when_configured(monkeypatch):
+    captured = {}
+
+    class Response:
+        def read(self):
+            return b'{"ok": true}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["auth"] = request.headers["Authorization"]
+        return Response()
+
+    monkeypatch.setattr(notifiers.urllib.request, "urlopen", fake_urlopen)
+    settings = config_mod.Notifiers(slack=True, slack_channel="C1", slack_token="xoxb-x")
+    alert = alerts_mod.Alert("five_hour", "critical", "枠を使い切りました", "リセット 17:10")
+
+    assert notifiers.notify_slack(alert, settings) is True
+    assert captured["body"]["channel"] == "C1"
+    assert "枠を使い切りました" in captured["body"]["text"]
+    # 本文にトークンを混ぜない（仕様書 §17）
+    assert "xoxb-" not in captured["body"]["text"]
+
+
+def test_slack_failure_is_not_fatal(monkeypatch):
+    def boom(request, timeout=None):
+        raise notifiers.urllib.error.URLError("down")
+
+    monkeypatch.setattr(notifiers.urllib.request, "urlopen", boom)
+    settings = config_mod.Notifiers(slack=True, slack_channel="C1", slack_token="xoxb-x")
+    alert = alerts_mod.Alert("five_hour", "warning", "x")
+    assert notifiers.notify_slack(alert, settings) is False
+
+
+def test_one_broken_notifier_does_not_stop_the_others(monkeypatch):
+    monkeypatch.setattr(notifiers, "notify_slack", lambda a, s: False)
+    settings = config_mod.Config(
+        notifiers=config_mod.Notifiers(terminal=False, file=True, slack=True,
+                                       slack_channel="C1", slack_token="x")
+    )
+    result = notifiers.deliver([alerts_mod.Alert("five_hour", "warning", "x")], settings)
+    assert result["file"] == 1 and result["slack"] == 0
+
+
+def test_powershell_quoting_escapes_single_quotes():
+    # 通知本文にアポストロフィが入るとコマンドが壊れる
+    quoted = notifiers._ps_quote("it" + chr(39) + "s")
+    assert quoted == chr(39) + "it" + chr(39) * 2 + "s" + chr(39)
+
+
+# --- 設定 ---
+
+def test_config_defaults_without_a_file():
+    settings = config_mod.load()
+    assert settings.thresholds.warning == 70.0
+    assert settings.retention_days == 90
+    assert settings.alerts_enabled is True
+
+
+def test_config_is_read():
+    config_mod.config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_mod.config_path().write_text(
+        json.dumps({"thresholds": {"warning": 50}, "retention_days": 30,
+                    "notifiers": {"slack": True, "slack_channel": "C9"}}),
+        encoding="utf-8",
+    )
+    settings = config_mod.load()
+    assert settings.thresholds.warning == 50.0
+    assert settings.thresholds.high == 85.0        # 書いていない項目は既定のまま
+    assert settings.retention_days == 30
+    assert settings.notifiers.slack_channel == "C9"
+
+
+@pytest.mark.parametrize(
+    "body", ["{ broken", "[]", '{"thresholds": "壊れている"}', '{"retention_days": "90"}']
+)
+def test_broken_config_falls_back_to_defaults(body):
+    config_mod.config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_mod.config_path().write_text(body, encoding="utf-8")
+    # 設定の不備で statusline を落とさない
+    assert config_mod.load().thresholds.warning == 70.0
+
+
+def test_config_template_does_not_overwrite():
+    assert config_mod.write_template() is True
+    config_mod.config_path().write_text('{"retention_days": 7}', encoding="utf-8")
+    assert config_mod.write_template() is False
+    assert config_mod.load().retention_days == 7
+
+
+# --- CLI ---
+
+def test_cli_alerts_view(capsys):
+    snap.save(shot(five=(72.0, NOW + timedelta(hours=3))))
+    assert cli.main(["alerts"]) == 0
+    out = capsys.readouterr().out
+    assert "いまの判定" in out
+    assert "warning" in out
+
+
+def test_cli_config_writes_a_template(capsys):
+    assert cli.main(["config"]) == 0
+    assert config_mod.config_path().exists()
+
+
+def test_cli_prune(capsys):
+    snap.save(shot(five=(10.0, NOW + timedelta(hours=3)), at=NOW - timedelta(days=200)))
+    assert cli.main(["prune"]) == 0
+    assert "削除しました" in capsys.readouterr().out

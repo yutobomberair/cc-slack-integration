@@ -25,7 +25,7 @@ import json
 import sys
 from datetime import datetime, timezone
 
-from claude_usage import display
+from claude_usage import alerts, config, display, notifiers
 from claude_usage import snapshot as snap
 
 
@@ -83,8 +83,32 @@ def main(argv: list[str] | None = None) -> int:
     now = datetime.now(timezone.utc)
     shot = snap.parse(payload, now=now)
     snap.save(shot, raw=payload)
+
+    # 表示を先に出す。通知の判定で手間取っても statusline を遅らせない。
     display.write_line(render(shot, now=now))
+    _check_alerts(shot, now)
     return 0
+
+
+def _check_alerts(shot: snap.Snapshot, now: datetime) -> None:
+    """閾値とペースを見て、必要なら通知する。
+
+    ここが監視の起点。statusline が常に呼ばれているので daemon は要らない。
+    送信は別プロセスへ投げて待たない（Slack の HTTP や PowerShell の起動で
+    画面が固まるのを避ける）。
+
+    何があっても statusline を落とさない。
+    """
+    try:
+        settings = config.load()
+        if not settings.alerts_enabled:
+            return
+        fresh, state = alerts.pending(shot, snap.load_history(), settings, now)
+        if fresh:
+            notifiers.spawn(fresh)
+        alerts.save_state(state)
+    except Exception:  # noqa: BLE001 - 通知の失敗で表示を壊さない
+        pass
 
 
 if __name__ == "__main__":

@@ -3,6 +3,9 @@
     claude-usage              要点とペース判定
     claude-usage status       詳細（Confidence 付き）
     claude-usage --json       機械可読
+    claude-usage alerts       鳴った通知の履歴と、いまの判定
+    claude-usage config       設定ファイルの雛形を書き出す
+    claude-usage prune        保持期間を過ぎた履歴を捨てる
 
 値は statusline スクリプトが記録したスナップショットから読む。**こちらから取りに
 行く手段が無い**ので、Claude Code を使っていない間は更新されない。だから
@@ -15,7 +18,9 @@ import argparse
 import json
 from datetime import datetime, timezone
 
-from claude_usage import display, pace
+from claude_usage import alerts as alerts_mod
+from claude_usage import config as config_mod
+from claude_usage import display, notifiers, pace
 from claude_usage import snapshot as snap
 from claude_usage.snapshot import Snapshot, Window
 
@@ -222,15 +227,94 @@ statusline を設定すると、Claude Code が起動するたびに記録され
 手段がありません（詳細は .claude/doc/claude_code_usage_monitor_findings.md）。"""
 
 
+def render_alerts(shot: Snapshot, history: list[Snapshot], now: datetime) -> str:
+    """いまの判定と、鳴った履歴。閾値が妥当かを確かめるために両方出す。"""
+    settings = config_mod.load()
+    current = alerts_mod.decide(shot, history, settings, now)
+    state = alerts_mod.load_state()
+
+    lines = ["Alerts", "-" * 40, ""]
+    lines.append(f"設定: {config_mod.config_path()}")
+    lines.append(
+        f"  閾値 warning {settings.thresholds.warning:.0f}% / "
+        f"high {settings.thresholds.high:.0f}% / critical {settings.thresholds.critical:.0f}%"
+    )
+    lines.append(f"  使い残しの通知: {'有効' if settings.thresholds.underuse else '無効'}")
+    enabled = [n for n in ("terminal", "file", "windows", "slack")
+               if getattr(settings.notifiers, n)]
+    lines.append(f"  通知先: {', '.join(enabled) if enabled else '（なし）'}")
+    lines.append("")
+
+    lines.append("いまの判定")
+    if not current:
+        lines.append("  鳴らすものはありません")
+    for alert in current:
+        lines.append(f"  [{alert.level}] {alert.label} — {alert.headline}")
+        if alert.detail:
+            lines.append(f"    {alert.detail}")
+    lines.append("")
+
+    lines.append("鳴らした記録（枠ごと。枠が変われば鳴らし直す）")
+    if not state:
+        lines.append("  まだありません")
+    for window, recorded in state.items():
+        if isinstance(recorded, dict):
+            label = alerts_mod.WINDOW_LABELS.get(window, window)
+            lines.append(f"  {label}: {recorded.get('level')}（reset={recorded.get('reset')}）")
+    lines.append("")
+
+    try:
+        log = notifiers.log_path().read_text(encoding="utf-8").splitlines()
+    except OSError:
+        log = []
+    lines.append(f"履歴 {notifiers.log_path()}")
+    if not log:
+        lines.append("  まだありません")
+    for entry in log[-10:]:
+        lines.append(f"  {entry}")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="claude-usage", description="Claude Code の利用枠を監視する"
     )
     parser.add_argument(
-        "command", nargs="?", default="summary", choices=["summary", "status"]
+        "command",
+        nargs="?",
+        default="summary",
+        choices=["summary", "status", "alerts", "config", "prune"],
     )
     parser.add_argument("--json", action="store_true", help="JSON で出力する")
+    parser.add_argument(
+        "--test-notify", action="store_true", help="通知先の動作確認（テスト通知を送る）"
+    )
     args = parser.parse_args(argv)
+
+    if args.command == "config":
+        created = config_mod.write_template()
+        path = config_mod.config_path()
+        display.write_line(
+            f"設定ファイルを作成しました: {path}" if created
+            else f"設定ファイルは既にあります（上書きしません）: {path}"
+        )
+        return 0
+
+    if args.command == "prune":
+        settings = config_mod.load()
+        removed = snap.prune(settings.retention_days)
+        display.write_line(
+            f"{removed} 行を削除しました（保持 {settings.retention_days} 日）"
+        )
+        return 0
+
+    if args.test_notify:
+        sample = alerts_mod.Alert(
+            "five_hour", "warning", "これはテスト通知です", "claude-usage --test-notify"
+        )
+        result = notifiers.deliver([sample])
+        display.write_line("送信結果: " + ", ".join(f"{k}={v}" for k, v in result.items()))
+        return 0
 
     shot = snap.load_latest()
     if shot is None:
@@ -245,6 +329,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         print(json.dumps(build_json(shot, history, now), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "alerts":
+        display.write_line(render_alerts(shot, history, now))
         return 0
 
     if args.command == "status":
