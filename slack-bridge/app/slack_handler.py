@@ -84,6 +84,22 @@ def create_app(settings: Settings) -> App:
         thread_ts = event.get("thread_ts") or event.get("ts")
         thread = Thread(client, channel_id, thread_ts)
 
+        # usage はアカウント単位の情報で、プロジェクトを必要としない。だから
+        # 未登録チャンネルでも答える。CLAUDE.md §15 は「未登録チャンネルで
+        # Claude Code を実行しない」という規定であって、ここは Claude を起動せず
+        # 作業ディレクトリにも触らない。通知が届くチャンネル（プロジェクト設定を
+        # 持たない）で残量を聞けないと、通知だけ来て確認できないことになる。
+        usage_argument = usage.parse_directive(strip_mentions(event.get("text", "")))
+        if usage_argument is not None:
+            logger.info(
+                "利用枠を返しました channel=%s thread_ts=%s 指定=%s",
+                channel_id,
+                thread_ts,
+                usage_argument or "(要点)",
+            )
+            thread.post_long(usage.report(usage_argument))
+            return
+
         task = _accept(ctx, thread, event)
         if task is None:
             return
@@ -151,18 +167,6 @@ def _accept(ctx: BridgeContext, thread: Thread, event: dict) -> TaskRequest | No
     ls_argument = workdir_mod.parse_list_directive(prompt)
     if ls_argument is not None:
         _list_workdir(ctx, thread, project, ls_argument)
-        return None
-
-    # 「usage」は利用枠の確認。通知は届くのに自分から聞けない、を解消するため。
-    usage_argument = usage.parse_directive(prompt)
-    if usage_argument is not None:
-        logger.info(
-            "利用枠を返しました project=%s thread_ts=%s 指定=%s",
-            project.key,
-            thread.thread_ts,
-            usage_argument or "(要点)",
-        )
-        thread.post_long(usage.report(usage_argument))
         return None
 
     mode = task_mode.resolve(
