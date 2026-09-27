@@ -49,6 +49,7 @@ Slack の Events API は使わず **Socket Mode** で繋ぐ。自宅 PC に公�
 | `調査 haiku:` | 併用可。順番は問わない |
 | `共有: 1` | 出力ファイルを番号で受け取る |
 | `cd: movie` | 作業階層を変える（後述） |
+| `ls` | いまの階層のディレクトリを見る |
 
 スレッドは Claude Code のセッションに紐づく。同じスレッドで続けて話せば文脈が残る。
 
@@ -67,6 +68,23 @@ propose/
 └── movie/
     └── .claude/CLAUDE.md, skills/  ← propose/movie で起動すると読まれる
 ```
+
+まず `ls` で何があるか見る。移動先の候補が分からないと `cd:` を打てない。
+
+```
+📂 プロジェクト直下 の中身  📖 この階層に開発ルールあり
+Project: propose
+
+📁 metting/
+📁 movie/  📖 開発ルールあり
+
+`.gitignore` `.mcp.json` `PLAN.md`
+
+移動するには cd: <名前>。
+```
+
+`ls` はコロン無しでも動く。`ls: movie` のように引数を付けると、移動せずにその中を
+覗ける。`venv` や `node_modules` は移動先にならないので隠す。
 
 `cd:` でその階層を選ぶ。**スレッド単位で持続**するので、一度指定すれば以降の依頼は
 そこで実行される。
@@ -179,7 +197,7 @@ slack-bridge/app/
 
 ```bash
 cd slack-bridge
-./venv/Scripts/python.exe -m pytest tests/ -q     # 320 件
+./venv/Scripts/python.exe -m pytest tests/ -q     # 344 件
 ./venv/Scripts/python.exe -m ruff check app/ tests/ --select F
 ```
 

@@ -30,6 +30,19 @@ logger = logging.getLogger(__name__)
 ROOT_TOKENS = {".", "/", "~", "root", "ルート", "直下"}
 
 _DIRECTIVE_TOKENS = ("cd", "dir", "/cd", "階層", "移動")
+_LIST_TOKENS = ("ls", "/ls", "list", "一覧", "中身")
+
+#: 一覧から外すディレクトリ。見えても移動先として意味が無いものを隠す。
+_HIDDEN_DIRS = {
+    ".git", ".hg", ".svn", "venv", ".venv", "env", "node_modules", "__pycache__",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build", ".next",
+    ".nuxt", "target", ".gradle", ".idea", ".vscode",
+    # .claude は移動先にならない。その階層にルールがあることは見出しで示す。
+    ".claude",
+}
+
+#: 一覧に出す最大件数。スマホで読めなくなるので切る。
+MAX_ENTRIES = 40
 
 
 class WorkdirError(ValueError):
@@ -48,6 +61,65 @@ def parse_directive(prompt: str) -> str | None:
         if sep and key.strip().lower() in _DIRECTIVE_TOKENS:
             return value.strip()
     return None
+
+
+def parse_list_directive(prompt: str) -> str | None:
+    """``ls`` なら対象（空文字なら現在の階層）を返す。``ls: movie`` なら ``"movie"``。
+
+    ``cd:`` と違い、コロンが無い ``ls`` 単独も受ける。一番よく打つ形なので
+    コロンを強制すると使いにくい。
+    """
+    text = (prompt or "").strip()
+    if not text:
+        return None
+    head = text.splitlines()[0].strip()
+
+    if head.lower() in _LIST_TOKENS:
+        return ""
+    for separator in (":", "："):
+        key, sep, value = head.partition(separator)
+        if sep and key.strip().lower() in _LIST_TOKENS:
+            return value.strip()
+    # 「ls movie」のようにコロン無しで引数を付けた形
+    parts = head.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() in _LIST_TOKENS:
+        return parts[1].strip()
+    return None
+
+
+def listing(target: Path) -> tuple[list[tuple[str, bool]], list[str], int]:
+    """``target`` 直下の (ディレクトリ, ファイル, 省略件数) を返す。
+
+    ディレクトリには「``.claude/`` を持つか」を添える。``cd:`` の移動先として
+    意味があるのはそこなので、一覧から直接判断できるようにする。
+
+    ``venv`` や ``node_modules`` のような見ても移動しない場所は隠す。
+    """
+    dirs: list[tuple[str, bool]] = []
+    files: list[str] = []
+    try:
+        entries = sorted(Path(target).iterdir(), key=lambda e: e.name.lower())
+    except OSError:
+        return [], [], 0
+
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                if entry.name in _HIDDEN_DIRS:
+                    continue
+                dirs.append((entry.name, (entry / ".claude").is_dir()))
+            elif entry.is_file():
+                files.append(entry.name)
+        except OSError:
+            continue
+
+    total = len(dirs) + len(files)
+    if total <= MAX_ENTRIES:
+        return dirs, files, 0
+    # ディレクトリを優先して残す。移動先を探すのが目的なので。
+    kept_dirs = dirs[:MAX_ENTRIES]
+    room = MAX_ENTRIES - len(kept_dirs)
+    return kept_dirs, files[:room], total - len(kept_dirs) - min(room, len(files))
 
 
 def resolve(project_root: Path, requested: str) -> Path:
@@ -111,6 +183,42 @@ def candidates(project_root: Path, limit: int = 12) -> list[str]:
 # --------------------------------------------------------------------------
 # 返信の文面
 # --------------------------------------------------------------------------
+
+def listing_message(
+    project_name: str,
+    label: str,
+    dirs: list[tuple[str, bool]],
+    files: list[str],
+    omitted: int,
+    has_rules: bool = False,
+) -> str:
+    """``ls`` の返信。移動できる先が分かることを優先する。"""
+    where = f"`{label}/`" if label else "プロジェクト直下"
+    here = "  :book: この階層に開発ルールあり" if has_rules else ""
+    lines = [
+        f":open_file_folder: {where} の中身{here}",
+        f"Project: *{project_name}*",
+        "",
+    ]
+
+    if dirs:
+        for name, has_rules in dirs:
+            mark = "  :book: 開発ルールあり" if has_rules else ""
+            lines.append(f":file_folder: `{name}/`{mark}")
+    if files:
+        if dirs:
+            lines.append("")
+        lines.append(" ".join(f"`{name}`" for name in files))
+    if not dirs and not files:
+        lines.append("（空です）")
+    if omitted:
+        lines.append(f"…ほか {omitted} 件")
+
+    if dirs:
+        lines.append("")
+        lines.append("移動するには `cd: <名前>`。")
+    return "\n".join(lines)
+
 
 def changed_message(project_name: str, label: str) -> str:
     where = f"`{label}/`" if label else "プロジェクト直下"

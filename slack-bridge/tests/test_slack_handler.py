@@ -565,3 +565,37 @@ def test_commit_works_from_a_subdirectory(dispatch, ran, nested):
     ).stdout
     assert "movie/new.py" in committed
     assert not client.said("did not match any files")
+
+def test_ls_lists_the_current_level(dispatch, ran, nested):
+    (nested / "metting").mkdir()
+    client = FakeClient()
+    dispatch(client, text="ls")
+
+    assert ran == []                      # Claude は起動しない
+    assert client.said("movie/")
+    assert client.said("metting/")
+
+
+def test_ls_follows_the_current_workdir(dispatch, ran, nested):
+    (nested / "movie" / "blend").mkdir()
+    dispatch(FakeClient(), text="cd: movie")
+    client = FakeClient()
+    dispatch(client, text="ls", event_id="Ev2")
+
+    assert client.said("blend/")
+
+
+def test_ls_with_an_argument_does_not_move(dispatch, ran, nested):
+    (nested / "movie" / "blend").mkdir()
+    client = FakeClient()
+    dispatch(client, text="ls: movie")
+    assert client.said("blend/")
+
+    dispatch(FakeClient(), text="やって", event_id="Ev2")
+    assert ran[0]["working_directory"] == nested   # 移動していない
+
+
+def test_ls_outside_the_project_is_refused(dispatch, ran, nested):
+    client = FakeClient()
+    dispatch(client, text="ls: ../..")
+    assert client.said("外へは移動できません")

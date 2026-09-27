@@ -139,6 +139,12 @@ def _accept(ctx: BridgeContext, thread: Thread, event: dict) -> TaskRequest | No
         _change_workdir(ctx, thread, project, cd_argument)
         return None
 
+    # 「ls」はディレクトリを見るだけ。cd: の移動先を知るために要る。
+    ls_argument = workdir_mod.parse_list_directive(prompt)
+    if ls_argument is not None:
+        _list_workdir(ctx, thread, project, ls_argument)
+        return None
+
     mode = task_mode.resolve(
         prompt,
         project.profile,
@@ -229,3 +235,40 @@ def _change_workdir(ctx: BridgeContext, thread: Thread, project, requested: str)
         label or "(直下)",
     )
     thread.post(workdir_mod.changed_message(project.name, label))
+
+
+def _list_workdir(ctx: BridgeContext, thread: Thread, project, requested: str) -> None:
+    """``ls`` を処理する。Claude は起動しない。
+
+    引数が無ければ現在の作業階層を見る。``cd:`` の移動先を知るために要るので、
+    ``cd:`` と同じ境界（プロジェクト配下のみ）を通す。
+    """
+    current = ctx.workdirs.get(thread.channel_id, thread.thread_ts)
+    base = requested or current
+    try:
+        target = workdir_mod.resolve(project.working_directory, base)
+    except workdir_mod.WorkdirError as exc:
+        options = workdir_mod.candidates(project.working_directory)
+        thread.post(workdir_mod.error_message(project.name, str(exc), options))
+        return
+
+    label = workdir_mod.relative_label(project.working_directory, target)
+    dirs, files, omitted = workdir_mod.listing(target)
+    logger.info(
+        "階層の一覧を返しました project=%s thread_ts=%s workdir=%s dirs=%d files=%d",
+        project.key,
+        thread.thread_ts,
+        label or "(直下)",
+        len(dirs),
+        len(files),
+    )
+    thread.post_long(
+        workdir_mod.listing_message(
+            project.name,
+            label,
+            dirs,
+            files,
+            omitted,
+            has_rules=(target / ".claude").is_dir(),
+        )
+    )

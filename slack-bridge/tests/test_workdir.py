@@ -188,3 +188,79 @@ def test_store_tolerates_corrupt_file(tmp_path):
     path = tmp_path / "w.json"
     path.write_text("{ broken", encoding="utf-8")
     assert workdir.WorkdirStore(path).get("C1", "1.0") == ""
+
+# --------------------------------------------------------------------------
+# ls（cd: の移動先を知るために要る）
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text", ["ls", "LS", "list", "一覧", "中身", "/ls"])
+def test_list_directive_without_argument(text):
+    # コロン無しの単独形を受ける。一番よく打つので強制すると使いにくい
+    assert workdir.parse_list_directive(text) == ""
+
+
+@pytest.mark.parametrize("text", ["ls: movie", "ls：movie", "ls movie", "list: movie", "一覧: movie"])
+def test_list_directive_with_argument(text):
+    assert workdir.parse_list_directive(text) == "movie"
+
+
+def test_list_directive_does_not_match_plain_text():
+    assert workdir.parse_list_directive("movie の構成を教えて") is None
+    assert workdir.parse_list_directive("lsof の使い方を調べて") is None
+
+
+def test_listing_separates_directories_and_files(project):
+    (project / "PLAN.md").write_text("x", encoding="utf-8")
+    dirs, files, omitted = workdir.listing(project)
+
+    assert [name for name, _ in dirs] == ["metting", "movie"]
+    assert files == ["PLAN.md"]
+    assert omitted == 0
+
+
+def test_listing_marks_directories_with_dev_rules(project):
+    dirs, _, _ = workdir.listing(project)
+    assert dict(dirs) == {"metting": False, "movie": True}
+
+
+def test_listing_hides_noise_directories(project):
+    for name in ("venv", "node_modules", "__pycache__", ".git"):
+        (project / name).mkdir()
+    dirs, _, _ = workdir.listing(project)
+    assert [name for name, _ in dirs] == ["metting", "movie"]
+
+
+def test_listing_hides_the_claude_directory(project):
+    # 移動先にならない。その階層にルールがあることは見出しで示す
+    dirs, _, _ = workdir.listing(project)
+    assert ".claude" not in [name for name, _ in dirs]
+
+
+def test_listing_of_a_missing_directory_is_empty(project):
+    assert workdir.listing(project / "nope") == ([], [], 0)
+
+
+def test_listing_keeps_directories_when_truncating(project):
+    for i in range(workdir.MAX_ENTRIES):
+        (project / f"d{i:03d}").mkdir()
+        (project / f"f{i:03d}.txt").write_text("x", encoding="utf-8")
+    dirs, files, omitted = workdir.listing(project)
+
+    # 移動先を探すのが目的なのでディレクトリを優先して残す
+    assert len(dirs) == workdir.MAX_ENTRIES
+    assert files == []
+    assert omitted > 0
+
+
+def test_listing_message_guides_to_cd(project):
+    dirs, files, omitted = workdir.listing(project)
+    text = workdir.listing_message("propose", "", dirs, files, omitted, has_rules=True)
+
+    assert "`movie/`" in text
+    assert "開発ルールあり" in text
+    assert "cd: <名前>" in text
+
+
+def test_listing_message_of_an_empty_directory(tmp_path):
+    text = workdir.listing_message("proj", "empty", [], [], 0)
+    assert "（空です）" in text
