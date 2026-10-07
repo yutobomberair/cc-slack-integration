@@ -16,7 +16,11 @@ from app import formatting, git_ops  # noqa: E402
 @pytest.mark.parametrize(
     "url,owner,repo",
     [
-        ("https://github.com/yutobomberair/navigation-core.git", "yutobomberair", "navigation-core"),
+        (
+            "https://github.com/yutobomberair/navigation-core.git",
+            "yutobomberair",
+            "navigation-core",
+        ),
         ("https://github.com/yutobomberair/navigation-core", "yutobomberair", "navigation-core"),
         ("git@github.com:yutobomberair/Pet-Camera.git", "yutobomberair", "Pet-Camera"),
         ("ssh://git@github.com/owner/repo.git", "owner", "repo"),

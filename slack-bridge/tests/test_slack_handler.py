@@ -645,3 +645,217 @@ def test_usage_works_in_a_registered_channel_too(dispatch, ran):
     dispatch(client, text="usage")
     assert ran == []
     assert not client.said("プロジェクトが設定されていません")
+
+
+# --------------------------------------------------------------------------
+# モデルと推論の強さ
+#
+# 元の問題は「Slack でどのモデルが使われたか確認できない」こと。前置きを書かない
+# 通常ケースではモデル名が空だった。要求値ではなく**実際に使われたモデル**を
+# 応答から読んで出すのが肝。
+# --------------------------------------------------------------------------
+
+from app import model_prefs  # noqa: E402
+
+
+def test_actual_model_is_reported_even_without_a_request(dispatch, monkeypatch):
+    """指定しなくても、何で動いたか分かる（これが元の問題）。"""
+    monkeypatch.setattr(
+        claude_runner,
+        "run",
+        lambda **k: ClaudeResult(ok=True, text="ok", model="claude-opus-5",
+                                 models=["claude-opus-5"]),
+    )
+    client = FakeClient()
+    dispatch(client, text="直して")
+
+    assert any("claude-opus-5" in u.get("text", "") for u in client.updates) or client.said(
+        "claude-opus-5"
+    )
+
+
+def test_mismatch_between_request_and_actual_is_flagged(dispatch, monkeypatch):
+    """「指定したつもりが効いていなかった」を黙って通さない。"""
+    monkeypatch.setattr(
+        claude_runner,
+        "run",
+        lambda **k: ClaudeResult(ok=True, text="ok", model="claude-opus-5",
+                                 models=["claude-opus-5"]),
+    )
+    client = FakeClient()
+    dispatch(client, text="haiku: 直して")
+
+    everything = " ".join(client.texts + [u.get("text", "") for u in client.updates])
+    assert "haiku" in everything and "claude-opus-5" in everything
+
+
+# --- インライン指定（その依頼だけ） ---
+
+def test_inline_effort_is_passed_to_the_cli(dispatch, ran):
+    dispatch(FakeClient(), text="max: 難しい設計を詰めて")
+    assert ran[0]["effort"] == "max"
+
+
+def test_inline_model_and_effort_together(dispatch, ran):
+    dispatch(FakeClient(), text="max opus: 直して")
+    assert ran[0]["model"] == "opus"
+    assert ran[0]["effort"] == "max"
+
+
+def test_inline_order_does_not_matter(dispatch, ran):
+    dispatch(FakeClient(), text="opus max: 直して")
+    assert (ran[0]["model"], ran[0]["effort"]) == ("opus", "max")
+
+
+def test_inline_effort_combines_with_a_mode(dispatch, ran):
+    dispatch(FakeClient(), text="調査 low: ざっと見て")
+    assert ran[0]["effort"] == "low"
+    assert ran[0]["profile"].key == "investigate"
+
+
+def test_unknown_effort_is_rejected_before_running(dispatch, ran):
+    client = FakeClient()
+    dispatch(client, text="調査 ultra: 見て")
+
+    assert ran == []
+    assert client.said("ultra")
+    assert client.said("推論の強さ")      # 候補を案内する
+
+
+# --- スレッドの設定（持続する） ---
+
+def test_model_directive_persists_in_the_thread(dispatch, ran):
+    client = FakeClient()
+    dispatch(client, text="model: sonnet")
+    assert ran == []                      # Claude は起動しない
+    assert client.said("sonnet")
+
+    dispatch(FakeClient(), text="直して", event_id="Ev2")
+    assert ran[0]["model"] == "sonnet"
+
+
+def test_effort_directive_persists_in_the_thread(dispatch, ran):
+    dispatch(FakeClient(), text="effort: max")
+    dispatch(FakeClient(), text="直して", event_id="Ev2")
+    assert ran[0]["effort"] == "max"
+
+
+def test_effort_directive_warns_about_consumption(dispatch, ran):
+    # 上げるとトークンを多く使うので、利用枠に響くことを伝える
+    client = FakeClient()
+    dispatch(client, text="effort: max")
+    assert client.said("利用枠の消費")
+
+
+def test_inline_beats_the_thread_setting(dispatch, ran):
+    dispatch(FakeClient(), text="model: sonnet")
+    dispatch(FakeClient(), text="haiku: 直して", event_id="Ev2")
+    assert ran[0]["model"] == "haiku"
+
+
+def test_thread_setting_can_be_cleared(dispatch, ran):
+    dispatch(FakeClient(), text="model: sonnet")
+    dispatch(FakeClient(), text="model: 既定", event_id="Ev2")
+    dispatch(FakeClient(), text="直して", event_id="Ev3")
+    assert ran[0]["model"] is None
+
+
+def test_cd_does_not_wipe_the_model_setting(dispatch, ran, project_dir):
+    """1つの記録にまとめた結果、階層を戻すとモデルが消える事故が起きうる。"""
+    (project_dir / "movie").mkdir()
+    dispatch(FakeClient(), text="model: sonnet")
+    dispatch(FakeClient(), text="cd: movie", event_id="Ev2")
+    dispatch(FakeClient(), text="cd: .", event_id="Ev3")
+    dispatch(FakeClient(), text="直して", event_id="Ev4")
+
+    assert ran[0]["model"] == "sonnet"
+
+
+def test_model_without_argument_shows_the_current_setting(dispatch, ran):
+    dispatch(FakeClient(), text="effort: high")
+    client = FakeClient()
+    dispatch(client, text="model", event_id="Ev2")
+
+    assert ran == []
+    assert client.said("high")             # いまの設定が分かる
+    assert client.said("使えるモデル")
+
+
+def test_unknown_model_setting_is_refused(dispatch, ran):
+    client = FakeClient()
+    dispatch(client, text="model: gpt5")
+    assert client.said("gpt5")
+
+    dispatch(FakeClient(), text="直して", event_id="Ev2")
+    assert ran[0]["model"] is None         # 設定されていない
+
+
+# --- プロジェクトの既定 ---
+
+def test_project_default_model_is_used(settings, ran, monkeypatch):
+    import dataclasses
+
+    project = dataclasses.replace(settings.projects["demo"], model="sonnet", effort="high")
+    settings = dataclasses.replace(settings, projects={"demo": project})
+    monkeypatch.setattr(slack_handler, "ThreadPoolExecutor", SyncExecutor)
+    app = slack_handler.create_app(settings)
+    app._listeners[0].ack_function(
+        body={"event_id": "E"},
+        event={"channel": "C111", "ts": "1.0", "text": "<@U999> 直して"},
+        client=FakeClient(),
+    )
+    assert (ran[0]["model"], ran[0]["effort"]) == ("sonnet", "high")
+
+
+def test_thread_setting_beats_the_project_default(settings, ran, monkeypatch):
+    import dataclasses
+
+    project = dataclasses.replace(settings.projects["demo"], model="sonnet")
+    settings = dataclasses.replace(settings, projects={"demo": project})
+    monkeypatch.setattr(slack_handler, "ThreadPoolExecutor", SyncExecutor)
+    app = slack_handler.create_app(settings)
+    handler = app._listeners[0].ack_function
+
+    for i, text in enumerate(["model: haiku", "直して"]):
+        handler(
+            body={"event_id": f"E{i}"},
+            event={"channel": "C111", "ts": "1.0", "text": f"<@U999> {text}"},
+            client=FakeClient(),
+        )
+    assert ran[0]["model"] == "haiku"
+
+
+# --- ディレクティブの解釈 ---
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("model: sonnet", ("model", "sonnet")),
+        ("model sonnet", ("model", "sonnet")),
+        ("モデル: sonnet", ("model", "sonnet")),
+        ("model", ("model", "")),
+        ("effort: max", ("effort", "max")),
+        ("推論: max", ("effort", "max")),
+        ("effort", ("effort", "")),
+    ],
+)
+def test_pref_directive_parsing(text, expected):
+    assert model_prefs.parse_directive(text) == expected
+
+
+def test_pref_directive_ignores_plain_text():
+    assert model_prefs.parse_directive("モデルの選び方を教えて") is None
+    assert model_prefs.parse_directive("この仕組みについて\nmodel: の挙動") is None
+
+
+@pytest.mark.parametrize("token", ["既定", "default", "reset", "-", "なし"])
+def test_reset_tokens_clear_the_setting(token):
+    assert model_prefs.validate("model", token, ["opus"]) == ""
+
+
+def test_validate_rejects_unknown_values():
+    assert model_prefs.validate("model", "gpt5", ["opus", "sonnet"]) is None
+
+
+def test_validate_is_case_insensitive():
+    assert model_prefs.validate("model", "OPUS", ["opus"]) == "opus"

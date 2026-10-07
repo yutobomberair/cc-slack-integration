@@ -149,14 +149,44 @@ def _mode_label(implement: bool) -> str:
     return ":pencil2: 実装モード" if implement else ":mag: 調査モード"
 
 
+def _model_mismatch_note(requested: str | None, actual: str | None) -> str:
+    """指定したモデルと実際に使われたモデルが違う場合に知らせる。
+
+    「指定したつもりが効いていなかった」を黙って通さない。エイリアス（``opus``）と
+    正式名（``claude-opus-5``）は一致しないので、含まれるかどうかで判断する。
+    """
+    if not requested or not actual:
+        return ""
+    if requested.lower() in actual.lower():
+        return ""
+    return f" :warning: `{requested}` を指定しましたが `{actual}` で実行されました"
+
+
+def _extra_models_note(models: list | None) -> str:
+    """複数のモデルが使われた場合（fallback が働いたときなど）。"""
+    if not models:
+        return ""
+    listed = " / ".join(f"`{m}`" for m in models)
+    return f" （他に {listed} も使用）"
+
+
 def _workdir_label(workdir: str | None) -> str:
     """作業階層の表示。どこで動いているか分からないまま実装が走るのを防ぐ。"""
     return f" / :file_folder: {workdir}/" if workdir else ""
 
 
 def _model_label(model: str | None) -> str:
-    """実行モデルの表示。速度もコストも大きく変わるので毎回見えるようにする。"""
+    """実行モデルの表示。速度もコストも大きく変わるので毎回見えるようにする。
+
+    完了メッセージには**実際に使われたモデル**を渡す（要求値ではない）。指定しな
+    かった場合も分かるので、これが「何で動いたか」の唯一の確認手段になる。
+    """
     return f" / :brain: {model}" if model else ""
+
+
+def _effort_label(effort: str | None) -> str:
+    """推論の強さ。上げるとトークンを多く使うので見えるようにする。"""
+    return f" / :gear: {effort}" if effort else ""
 
 
 def start_message(
@@ -164,14 +194,19 @@ def start_message(
     continued: bool = False,
     implement: bool = False,
     model: str | None = None,
+    effort: str | None = None,
     workdir: str | None = None,
 ) -> str:
-    """実行開始時の1行目。以降 chat.update で書き換えていく（CLAUDE.md §12）。"""
+    """実行開始時の1行目。以降 chat.update で書き換えていく（CLAUDE.md §12）。
+
+    ここで出せるのは**要求値**。実際に使われたモデルは実行後しか分からないので、
+    完了メッセージで上書きする。
+    """
     mode = "スレッドの会話を継続します" if continued else "処理を開始しました"
     return (
         f":hourglass_flowing_sand: {mode}。\n"
         f"Project: *{project_name}*{_workdir_label(workdir)} / {_mode_label(implement)}"
-        f"{_model_label(model)}"
+        f"{_model_label(model)}{_effort_label(effort)}"
     )
 
 
@@ -181,6 +216,7 @@ def progress_message(
     continued: bool = False,
     implement: bool = False,
     model: str | None = None,
+    effort: str | None = None,
     workdir: str | None = None,
 ) -> str:
     """実行中の経過表示。start_message を chat.update で置き換える形で使う。"""
@@ -188,7 +224,7 @@ def progress_message(
     return (
         f":hourglass_flowing_sand: {mode}… （{format_duration(elapsed)} 経過）\n"
         f"Project: *{project_name}*{_workdir_label(workdir)} / {_mode_label(implement)}"
-        f"{_model_label(model)}"
+        f"{_model_label(model)}{_effort_label(effort)}"
     )
 
 
@@ -198,7 +234,10 @@ def completed_header(
     cost_usd: float | None = None,
     turns: int | None = None,
     model: str | None = None,
+    effort: str | None = None,
     workdir: str | None = None,
+    requested_model: str | None = None,
+    extra_models: list | None = None,
 ) -> str:
     """完了時に開始メッセージを置き換えるヘッダ。"""
     stats = [format_duration(elapsed)]
@@ -209,6 +248,8 @@ def completed_header(
     return (
         f":white_check_mark: 完了しました。（{' / '.join(stats)}）\n"
         f"Project: *{project_name}*{_workdir_label(workdir)}{_model_label(model)}"
+        f"{_effort_label(effort)}{_model_mismatch_note(requested_model, model)}"
+        f"{_extra_models_note(extra_models)}"
     )
 
 

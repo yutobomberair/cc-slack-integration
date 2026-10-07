@@ -29,5 +29,6 @@ def unknown_channel_message(channel_id: str) -> str:
     return (
         ":warning: このチャンネルには Claude Code のプロジェクトが設定されていません。\n\n"
         f"channel_id:\n`{channel_id}`\n\n"
-        "`config/projects.yaml` にこの channel_id を追加してから Slack Bridge を再起動してください。"
+        "`config/projects.yaml` にこの channel_id を追加してから "
+        "Slack Bridge を再起動してください。"
     )

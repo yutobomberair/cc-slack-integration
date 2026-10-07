@@ -48,7 +48,8 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
             elapsed,
             continued=task.continued,
             implement=task.implement,
-            model=task.model or settings.runtime.model,
+            model=task.model,
+            effort=task.effort,
             workdir=task.workdir_label,
         ),
         interval=settings.runtime.progress_interval_seconds,
@@ -74,6 +75,7 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
                 session_id=session_id,
                 resume=task.continued,
                 model=task.model,
+                effort=task.effort,
             )
     except Exception as exc:  # noqa: BLE001 - ワーカーの最終防衛線
         logger.exception("タスク実行中に予期しない例外が発生しました")
@@ -100,8 +102,13 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
             reporter.elapsed,
             result.cost_usd,
             result.num_turns,
-            model=task.model or settings.runtime.model,
+            # 要求値ではなく実際に使われたモデルを出す。指定しなかった場合も
+            # 分かるので、これが「何で動いたか」の唯一の確認手段になる。
+            model=result.model or task.model,
+            effort=task.effort,
             workdir=task.workdir_label,
+            requested_model=task.model,
+            extra_models=result.models[1:] if len(result.models) > 1 else [],
         )
     )
     logger.info(

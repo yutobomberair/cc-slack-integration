@@ -44,6 +44,11 @@ class ClaudeResult:
     permission_denials: list = field(default_factory=list)
     # 継続に失敗し、新規セッションとしてやり直した場合に True
     session_restarted: bool = False
+    #: 実際に使われたモデル（応答の modelUsage から読む）。要求値ではなく事実。
+    #: 指定しなかった場合も分かるので、これが唯一の確認手段になる。
+    model: str | None = None
+    #: 複数のモデルが使われた場合の全部（fallback が働いたときなど）。
+    models: list = field(default_factory=list)
 
 
 def resolve_cli() -> str:
@@ -63,6 +68,7 @@ def build_command(
     session_id: str | None = None,
     resume: bool = False,
     model: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     """CLI 引数を組み立てる（プロンプトは stdin で渡すので argv には含めない）。
 
@@ -98,6 +104,10 @@ def build_command(
     chosen_model = model or runtime.model
     if chosen_model:
         cmd += ["--model", chosen_model]
+    # 推論の強さ。上げるとトークンを多く使うので、利用枠の消費に直接響く。
+    chosen_effort = effort or runtime.effort
+    if chosen_effort:
+        cmd += ["--effort", chosen_effort]
     if session_id:
         # スレッド単位のセッション継続（CLAUDE.md §11, §23.2）。
         cmd += (["--resume", session_id] if resume else ["--session-id", session_id])
@@ -117,6 +127,7 @@ def run(
     session_id: str | None = None,
     resume: bool = False,
     model: str | None = None,
+    effort: str | None = None,
 ) -> ClaudeResult:
     """Claude Code を1回実行する。
 
@@ -124,18 +135,24 @@ def run(
     新規セッションとして1度だけやり直す。スレッドでの会話が復旧不能になるより、
     文脈を失ってでも応答を返すほうが実用的なため。
     """
-    result = _run_once(prompt, working_directory, profile, runtime, session_id, resume, model)
+    result = _run_once(
+        prompt, working_directory, profile, runtime, session_id, resume, model, effort
+    )
 
     if resume and not result.ok and SESSION_MISSING_MARKER in result.error:
         logger.info("継続対象のセッションが見つかりません。新規セッションで再実行します")
-        result = _run_once(prompt, working_directory, profile, runtime, session_id, False, model)
+        result = _run_once(
+            prompt, working_directory, profile, runtime, session_id, False, model, effort
+        )
         result.session_restarted = True
 
     elif not resume and not result.ok and SESSION_EXISTS_MARKER in result.error:
         # 記録側は「未作成」と思っているが、実際には既に存在するケース。
         # 多重起動やブリッジの異常終了で起こりうる。継続として実行し直す。
         logger.info("セッションが既に存在します。継続として再実行します")
-        result = _run_once(prompt, working_directory, profile, runtime, session_id, True, model)
+        result = _run_once(
+            prompt, working_directory, profile, runtime, session_id, True, model, effort
+        )
 
     return result
 
@@ -148,9 +165,12 @@ def _run_once(
     session_id: str | None,
     resume: bool,
     model: str | None = None,
+    effort: str | None = None,
 ) -> ClaudeResult:
     cli = resolve_cli()
-    cmd = build_command(cli, profile, runtime, session_id=session_id, resume=resume, model=model)
+    cmd = build_command(
+        cli, profile, runtime, session_id=session_id, resume=resume, model=model, effort=effort
+    )
 
     logger.info(
         "claude 実行開始 cwd=%s profile=%s timeout=%ss session=%s",
@@ -202,6 +222,7 @@ def _run_once(
             ),
         )
 
+    models = _models_used(payload)
     result = ClaudeResult(
         ok=not payload.get("is_error", False) and completed.returncode == 0,
         text=payload.get("result") or "",
@@ -210,6 +231,8 @@ def _run_once(
         cost_usd=payload.get("total_cost_usd"),
         num_turns=payload.get("num_turns"),
         permission_denials=payload.get("permission_denials") or [],
+        model=models[0] if models else None,
+        models=models,
     )
     if not result.ok and not result.error:
         result.error = result.text or _tail(stderr) or "Claude Code がエラーを返しました。"
@@ -223,6 +246,43 @@ def _run_once(
         len(result.permission_denials),
     )
     return result
+
+
+def _models_used(payload: dict) -> list[str]:
+    """応答から実際に使われたモデルを読む。トークンの多い順。
+
+    要求値（``--model`` に渡した値）ではなく**事実**を返すのが要点。指定しなかった
+    場合でも分かるので、「何で動いたのか」を確認する唯一の手段になる。
+    ``--fallback-model`` が働いた場合など、複数になりうるので全部返す。
+
+    ``modelUsage`` の形:
+
+        {"claude-haiku-4-5-20251001": {..., "canonicalModel": "claude-haiku-4-5"}}
+
+    表示に使うのは ``canonicalModel``（日付付きの正式名より読みやすい）。
+    """
+    usage = payload.get("modelUsage")
+    if not isinstance(usage, dict):
+        return []
+
+    def tokens(body) -> int:
+        if not isinstance(body, dict):
+            return 0
+        return sum(
+            int(body.get(key) or 0)
+            for key in ("inputTokens", "outputTokens", "cacheCreationInputTokens")
+            if isinstance(body.get(key), (int, float))
+        )
+
+    ordered = sorted(usage.items(), key=lambda kv: -tokens(kv[1]))
+    names = []
+    for raw_name, body in ordered:
+        name = raw_name
+        if isinstance(body, dict) and isinstance(body.get("canonicalModel"), str):
+            name = body["canonicalModel"]
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 def _tail(text: str, limit: int = 1500) -> str:

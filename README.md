@@ -46,6 +46,10 @@ Slack の Events API は使わず **Socket Mode** で繋ぐ。自宅 PC に公�
 | （何も書かない） | プロジェクトの既定プロファイルで実行 |
 | `調査:` `read:` | 読み取り専用に降格。ファイルは一切触らせない |
 | `haiku:` `opus:` | モデルを指定（`allowed_models` にある名前だけ） |
+| `max:` `low:` | 推論の強さを指定（low / medium / high / xhigh / max） |
+| `model: sonnet` | このスレッドのモデルを変える（持続する） |
+| `effort: max` | このスレッドの推論の強さを変える（持続する） |
+| `model` | いまの設定を見る |
 | `調査 haiku:` | 併用可。順番は問わない |
 | `共有: 1` | 出力ファイルを番号で受け取る |
 | `cd: movie` | 作業階層を変える（後述） |
@@ -57,6 +61,62 @@ Slack の Events API は使わず **Socket Mode** で繋ぐ。自宅 PC に公�
 ```
 @ClaudeCode さっきの調査の続きで、移行手順だけ詳しく出して
 ```
+
+## モデルと推論の強さ
+
+**実際に使われたモデルは完了メッセージに出る。** 要求値ではなく事実なので、
+何も指定しなかった場合も分かる。
+
+```
+✅ 完了しました。（20秒 / 2ターン / $0.02）
+Project: propose / 🧠 claude-haiku-4-5 / ⚙️ max
+```
+
+指定と食い違っていれば知らせる。「指定したつもりが効いていなかった」を黙って
+通さないため。
+
+```
+Project: propose / 🧠 claude-opus-5 ⚠️ `haiku` を指定しましたが `claude-opus-5` で実行されました
+```
+
+### 変え方は2通り
+
+**その依頼だけ** — 依頼文の先頭に書く。モデルと強さを併記でき、順序は問わない。
+
+```
+@ClaudeCode max opus: 難しい設計を詰めて
+@ClaudeCode 調査 low: ざっと見て
+```
+
+**スレッド全体** — `cd:` と同じく持続する。前置きを毎回打たずに済む。
+
+```
+@ClaudeCode model: sonnet      このスレッドは Sonnet で
+@ClaudeCode effort: max        推論を最大で
+@ClaudeCode model              いまの設定を見る
+@ClaudeCode model: 既定        プロジェクトの既定に戻す
+```
+
+### 優先順
+
+```
+1. 依頼文のインライン指定   max opus: 直して
+2. スレッドの設定           model: sonnet
+3. プロジェクトの既定       projects.yaml の project.model / effort
+4. runtime の既定           projects.yaml の runtime.model / effort
+5. Claude Code の既定       何も渡さない
+```
+
+この順序は `slack_handler._resolve_pref()` の1箇所だけで定義している。散らすと
+「指定したのに効かない」の原因が追えなくなる。
+
+### 推論の強さは利用枠に響く
+
+`effort` を上げるとトークンを多く使うので、5時間枠・7日枠の消費が速くなる。
+`effort:` で設定したときは、その旨を返信に添える。
+
+`usage` で残量を見てから決められる。枠が余っていれば `max`、残りが少なければ
+`low` という使い分けができる。
 
 ## 作業階層を選ぶ
 

@@ -90,7 +90,16 @@ runtime:
   max_workers: 1
   # 省略時は Claude Code の既定モデル。"opus" / "sonnet" / "haiku" など。
   # 依頼文の先頭で個別に指定できる（例: "haiku: 軽く調べて"）。
+  # プロジェクトごとに変えたい場合は、各 project に model を書く。
   model: null
+
+  # 推論の強さの既定（low / medium / high / xhigh / max）。
+  # 上げるとトークンを多く使うので利用枠の消費に直接響く。
+  # 依頼文の先頭で個別に指定できる（例: "max opus: 難しい設計を詰めて"）。
+  effort: null
+
+  # 依頼文で指定できる推論の強さ。CLI の --effort が受ける値に合わせる。
+  allowed_efforts: ["low", "medium", "high", "xhigh", "max"]
 
   # 依頼文で指定できるモデル。ここに無い名前は実行前に弾いて Slack へ知らせる。
   allowed_models: ["opus", "sonnet", "haiku", "fable"]

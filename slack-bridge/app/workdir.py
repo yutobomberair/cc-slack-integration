@@ -11,6 +11,10 @@ Claude Code は起動時の cwd から ``.claude/`` を探すので、プロジ�
 チャンネルごとに1つのパスに固定していると後者を使えないため、スレッド単位で
 配下の階層を選べるようにする。
 
+スレッドごとの記録は ``app/thread_prefs.py`` が持つ（階層・モデル・推論の強さは
+どれも「このスレッドでは何を使うか」という同じ性質の設定なのでまとめてある）。
+このモジュールは**パスの扱い**だけを持つ。
+
 **プロジェクト配下に限る。** ``..`` や絶対パスは弾く。ここに Slack からの入力が
 そのまま通ると、``config/projects.yaml`` による範囲指定の歯止めが効かなくなる
 （CLAUDE.md §15 の「未登録チャンネルでは実行しない」と同じ趣旨）。
@@ -18,10 +22,7 @@ Claude Code は起動時の cwd から ``.claude/`` を探すので、プロジ�
 
 from __future__ import annotations
 
-import json
 import logging
-import threading
-from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 logger = logging.getLogger(__name__)
@@ -247,71 +248,3 @@ def error_message(project_name: str, reason: str, options: list[str]) -> str:
         listed = " / ".join(f"`{o}`" for o in options)
         text += f"\n\n指定できる階層: {listed}"
     return text
-
-
-# --------------------------------------------------------------------------
-# スレッドごとの記録
-# --------------------------------------------------------------------------
-
-class WorkdirStore:
-    """スレッド -> 選ばれた階層（プロジェクト直下からの相対表記）。
-
-    ブリッジを再起動しても選択が残るようファイルへ落とす
-    （``SessionStore`` / ``ArtifactStore`` と同じ方針）。
-    """
-
-    def __init__(self, path: Path, max_entries: int = 300) -> None:
-        self._path = path
-        self._max_entries = max_entries
-        self._lock = threading.Lock()
-        self._data: dict[str, dict] = self._load()
-
-    def _load(self) -> dict[str, dict]:
-        if not self._path.exists():
-            return {}
-        try:
-            return json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            logger.warning("作業階層の記録を読めませんでした。空から開始します: %s", self._path)
-            return {}
-
-    def _save(self) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            tmp.replace(self._path)
-        except OSError:
-            logger.exception("作業階層の記録の保存に失敗しました: %s", self._path)
-
-    @staticmethod
-    def _key(channel_id: str, thread_ts: str) -> str:
-        return f"{channel_id}:{thread_ts}"
-
-    def get(self, channel_id: str, thread_ts: str) -> str:
-        """記録されている相対表記。無ければ空文字（プロジェクト直下）。"""
-        with self._lock:
-            self._data = self._load()
-            entry = self._data.get(self._key(channel_id, thread_ts))
-            return str(entry.get("workdir", "")) if entry else ""
-
-    def set(self, channel_id: str, thread_ts: str, project_key: str, label: str) -> None:
-        with self._lock:
-            self._data = self._load()
-            key = self._key(channel_id, thread_ts)
-            if not label:
-                # 直下に戻したら記録を持たない。既定と同じ状態を残す意味が無い。
-                self._data.pop(key, None)
-            else:
-                self._data[key] = {
-                    "project": project_key,
-                    "workdir": label,
-                    "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                }
-            if len(self._data) > self._max_entries:
-                ordered = sorted(self._data.items(), key=lambda kv: kv[1].get("updated_at", ""))
-                for stale, _ in ordered[: len(self._data) - self._max_entries]:
-                    del self._data[stale]
-            self._save()

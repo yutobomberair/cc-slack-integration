@@ -26,6 +26,7 @@ from app import (
     formatting,
     project_router,
     task_flow,
+    model_prefs,
     task_mode,
     usage,
 )
@@ -34,6 +35,7 @@ from app.concurrency import SeenEvents, ThreadLocks
 from app.config import Settings
 from app.reply import Thread
 from app.session_store import SessionStore
+from app import thread_prefs
 from app.task import BridgeContext, TaskRequest
 
 logger = logging.getLogger(__name__)
@@ -63,7 +65,7 @@ def create_app(settings: Settings) -> App:
         settings=settings,
         sessions=SessionStore(settings.runtime.session_store_path),
         outputs=artifacts.ArtifactStore(settings.runtime.artifact_store_path),
-        workdirs=workdir_mod.WorkdirStore(settings.runtime.workdir_store_path),
+        workdirs=thread_prefs.ThreadPrefs(settings.runtime.workdir_store_path),
         # 同一スレッドの二重実行を防ぐ。Claude Code のセッションは並行更新できない。
         thread_locks=ThreadLocks(),
     )
@@ -169,18 +171,27 @@ def _accept(ctx: BridgeContext, thread: Thread, event: dict) -> TaskRequest | No
         _list_workdir(ctx, thread, project, ls_argument)
         return None
 
+    # 「model: sonnet」「effort: max」はスレッドの設定。Claude は起動しない。
+    pref = model_prefs.parse_directive(prompt)
+    if pref is not None:
+        _change_pref(ctx, thread, project, *pref)
+        return None
+
     mode = task_mode.resolve(
         prompt,
         project.profile,
         project.allow_implement,
         allowed_models=list(settings.runtime.allowed_models),
+        allowed_efforts=list(settings.runtime.allowed_efforts),
     )
     if mode.unknown_model:
         # 打ち間違いを黙って既定モデルで走らせない。指定したつもりの利用者が
         # 気づけないまま別のモデルで課金されるのを避ける。
         thread.post(
             task_mode.unknown_model_message(
-                mode.unknown_model, list(settings.runtime.allowed_models)
+                mode.unknown_model,
+                list(settings.runtime.allowed_models),
+                list(settings.runtime.allowed_efforts),
             )
         )
         return None
@@ -194,14 +205,15 @@ def _accept(ctx: BridgeContext, thread: Thread, event: dict) -> TaskRequest | No
         thread.post(formatting.empty_after_directive_message())
         return None
 
-    # このスレッドで選ばれている階層。cd: していなければプロジェクト直下。
-    label = ctx.workdirs.get(thread.channel_id, thread.thread_ts)
+    # このスレッドの設定（階層・モデル・推論の強さ）。
+    prefs = ctx.workdirs.all(thread.channel_id, thread.thread_ts)
+    label = prefs.get("workdir", "")
     try:
         chosen_dir = workdir_mod.resolve(project.working_directory, label)
     except workdir_mod.WorkdirError:
         # 記録した階層が消えている（リポジトリを整理した等）。直下へ戻して続ける。
         logger.warning("記録された作業階層が使えません project=%s label=%s", project.key, label)
-        ctx.workdirs.set(thread.channel_id, thread.thread_ts, project.key, "")
+        ctx.workdirs.set(thread.channel_id, thread.thread_ts, project.key, workdir="")
         label, chosen_dir = "", project.working_directory
 
     continued = settings.runtime.session_continuation and ctx.sessions.is_started(
@@ -213,7 +225,8 @@ def _accept(ctx: BridgeContext, thread: Thread, event: dict) -> TaskRequest | No
             project.name,
             continued=continued,
             implement=mode.profile_key == task_mode.IMPLEMENT,
-            model=mode.model or settings.runtime.model,
+            model=_resolve_pref("model", mode.model, prefs, project, settings),
+            effort=_resolve_pref("effort", mode.effort, prefs, project, settings),
             workdir=label,
         )
     )
@@ -225,10 +238,74 @@ def _accept(ctx: BridgeContext, thread: Thread, event: dict) -> TaskRequest | No
         profile_key=mode.profile_key,
         message_ts=message_ts,
         continued=continued,
-        model=mode.model,
+        model=_resolve_pref("model", mode.model, prefs, project, settings),
+        effort=_resolve_pref("effort", mode.effort, prefs, project, settings),
         attached=attached,
         workdir=chosen_dir,
     )
+
+
+def _resolve_pref(field, inline, prefs: dict, project, settings: Settings) -> str | None:
+    """モデルと推論の強さを決める。優先順はこの1箇所だけで定義する。
+
+        1. 依頼文のインライン指定   max opus: 直して
+        2. スレッドの設定           model: sonnet
+        3. プロジェクトの既定       projects.yaml の project.model / effort
+        4. runtime の既定           projects.yaml の runtime.model / effort
+        5. Claude Code の既定       None（何も渡さない）
+
+    散らすと「指定したのに効かない」の原因が追えなくなるので関数にまとめる。
+    """
+    return (
+        inline
+        or prefs.get(field)
+        or getattr(project, field, None)
+        or getattr(settings.runtime, field, None)
+    )
+
+
+def _change_pref(ctx: BridgeContext, thread: Thread, project, field: str, value: str) -> None:
+    """``model: sonnet`` / ``effort: max`` を処理する。Claude は起動しない。"""
+    settings = ctx.settings
+    allowed = list(
+        settings.runtime.allowed_models if field == "model"
+        else settings.runtime.allowed_efforts
+    )
+    prefs = ctx.workdirs.all(thread.channel_id, thread.thread_ts)
+
+    if not value:
+        thread.post(
+            model_prefs.current_message(
+                prefs,
+                project.model or settings.runtime.model,
+                project.effort or settings.runtime.effort,
+                list(settings.runtime.allowed_models),
+                list(settings.runtime.allowed_efforts),
+            )
+        )
+        return
+
+    normalised = model_prefs.validate(field, value, allowed)
+    if normalised is None:
+        logger.info("%s の指定を拒否しました project=%s 指定=%s", field, project.key, value)
+        thread.post(model_prefs.error_message(field, value, allowed))
+        return
+
+    ctx.workdirs.set(
+        thread.channel_id, thread.thread_ts, project.key, **{field: normalised}
+    )
+    logger.info(
+        "%s を変更しました project=%s thread_ts=%s 値=%s",
+        field,
+        project.key,
+        thread.thread_ts,
+        normalised or "(既定)",
+    )
+    fallback = (
+        (project.model or settings.runtime.model) if field == "model"
+        else (project.effort or settings.runtime.effort)
+    )
+    thread.post(model_prefs.changed_message(field, normalised, fallback or ""))
 
 
 def _change_workdir(ctx: BridgeContext, thread: Thread, project, requested: str) -> None:
@@ -251,7 +328,7 @@ def _change_workdir(ctx: BridgeContext, thread: Thread, project, requested: str)
         return
 
     label = workdir_mod.relative_label(project.working_directory, target)
-    ctx.workdirs.set(thread.channel_id, thread.thread_ts, project.key, label)
+    ctx.workdirs.set(thread.channel_id, thread.thread_ts, project.key, workdir=label)
     logger.info(
         "作業階層を変更しました project=%s thread_ts=%s workdir=%s",
         project.key,

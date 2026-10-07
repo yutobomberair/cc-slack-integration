@@ -103,10 +103,14 @@ def save_files(files: list[dict], cwd: Path, token: str) -> list[Saved]:
 
         if not url:
             # 外部連携のファイル（Google Drive など）は実体を持たない
-            saved.append(Saved(path="", name=name, size=declared, error="ダウンロードURLがありません"))
+            saved.append(
+                Saved(path="", name=name, size=declared, error="ダウンロードURLがありません")
+            )
             continue
         if declared > MAX_DOWNLOAD_BYTES:
-            saved.append(Saved(path="", name=name, size=declared, error="サイズが上限を超えています"))
+            saved.append(
+                Saved(path="", name=name, size=declared, error="サイズが上限を超えています")
+            )
             continue
 
         try:
@@ -121,7 +125,11 @@ def save_files(files: list[dict], cwd: Path, token: str) -> list[Saved]:
             continue
 
         if len(payload) > MAX_DOWNLOAD_BYTES:
-            saved.append(Saved(path="", name=name, size=len(payload), error="サイズが上限を超えています"))
+            saved.append(
+                Saved(
+                    path="", name=name, size=len(payload), error="サイズが上限を超えています"
+                )
+            )
             continue
 
         try:

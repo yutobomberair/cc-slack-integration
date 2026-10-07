@@ -6,6 +6,7 @@
     調査: 構成を教えて                  → 読み取り専用に降格
     opus: 設計を詰めて                 → プロジェクト既定のまま、Opus
     調査 haiku: ざっと見て              → 読み取り専用、Haiku
+    max opus: 難しい設計を詰めて         → Opus、推論を最大で
 
 トークンは空白かカンマ区切りで、順序は問わない。既知のトークンが1つも無い区間は
 ディレクティブとして扱わないので、``TODO: 〜`` や ``URL: 〜`` のような普通の文が
@@ -44,8 +45,11 @@ _SPLIT_RE = re.compile(r"[\s,、]+")
 class TaskMode:
     profile_key: str
     prompt: str
-    #: 依頼文で指定されたモデル（未指定なら None = 設定の既定モデル）
+    #: 依頼文で指定されたモデル（未指定なら None = 上位の既定）
     model: str | None = None
+    #: 依頼文で指定された推論の強さ（未指定なら None = 上位の既定）。
+    #: 上げるとトークンを多く使うので利用枠の消費に直接響く。
+    effort: str | None = None
     #: 昇格を要求されたが、プロジェクト設定で許可されていない
     denied: bool = False
     #: 未知のモデル名が指定された
@@ -61,9 +65,11 @@ def resolve(
     project_profile: str,
     allow_implement: bool,
     allowed_models: list[str] | None = None,
+    allowed_efforts: list[str] | None = None,
 ) -> TaskMode:
-    """依頼文を解析し、プロファイル・モデル・本文を返す。"""
+    """依頼文を解析し、プロファイル・モデル・推論の強さ・本文を返す。"""
     allowed = {m.lower() for m in (allowed_models or [])}
+    efforts = {e.lower() for e in (allowed_efforts or [])}
     text = prompt or ""
 
     match = _DIRECTIVE_RE.match(text)
@@ -74,16 +80,18 @@ def resolve(
     wants_implement = any(t in _IMPLEMENT_TOKENS for t in tokens)
     wants_investigate = any(t in _INVESTIGATE_TOKENS for t in tokens)
     models = [t for t in tokens if t in allowed]
+    levels = [t for t in tokens if t in efforts]
     unknown = [
         t
         for t in tokens
         if t not in _IMPLEMENT_TOKENS
         and t not in _INVESTIGATE_TOKENS
         and t not in allowed
+        and t not in efforts
     ]
 
     # 既知のトークンが1つも無ければ、ただの文章。ディレクティブとして扱わない。
-    if not wants_implement and not wants_investigate and not models:
+    if not wants_implement and not wants_investigate and not models and not levels:
         return TaskMode(profile_key=project_profile, prompt=text.strip())
 
     # 既知トークンと一緒に未知トークンがある場合は、モデル名の打ち間違いとみなす。
@@ -113,6 +121,7 @@ def resolve(
         profile_key=profile_key,
         prompt=body,
         model=models[0] if models else None,
+        effort=levels[0] if levels else None,
     )
 
 
@@ -125,14 +134,27 @@ def implement_not_allowed_message(project_name: str) -> str:
     )
 
 
-def unknown_model_message(token: str, allowed_models: list[str]) -> str:
-    listed = " / ".join(f"`{m}`" for m in allowed_models)
-    return (
-        f":thinking_face: `{token}` というモデルは指定できません。\n\n"
-        f"使えるモデル: {listed}\n\n"
-        "例:\n"
+def unknown_model_message(
+    token: str, allowed_models: list[str], allowed_efforts: list[str] | None = None
+) -> str:
+    """打ち間違いを黙って既定で走らせないための案内。
+
+    モデルと推論の強さは同じディレクティブ区間に書けるので、どちらの候補も示す。
+    """
+    models = " / ".join(f"`{m}`" for m in allowed_models)
+    text = (
+        f":thinking_face: `{token}` は指定できません。\n\n"
+        f"使えるモデル: {models}\n"
+    )
+    if allowed_efforts:
+        listed = " / ".join(f"`{e}`" for e in allowed_efforts)
+        text += f"使える推論の強さ: {listed}\n"
+    text += (
+        "\n例:\n"
         "```\n"
         "opus: 設計を詰めて\n"
-        "実装 haiku: タイポを直して\n"
+        "max opus: 難しい設計を詰めて\n"
+        "調査 haiku: ざっと見て\n"
         "```"
     )
+    return text

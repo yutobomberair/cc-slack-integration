@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app import artifacts, inbox, task_mode
+from app import thread_prefs
 from app import workdir as workdir_mod
 from app.concurrency import ThreadLocks
 from app.config import Project, Settings
@@ -36,7 +37,7 @@ class BridgeContext:
     thread_locks: ThreadLocks
     #: スレッドごとの作業階層（``cd:``）。省略可能にすると渡し忘れが
     #: 実行時の AttributeError になるので必須にしておく。
-    workdirs: workdir_mod.WorkdirStore
+    workdirs: thread_prefs.ThreadPrefs
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,8 @@ class TaskRequest:
     message_ts: str | None = None
     continued: bool = False
     model: str | None = None
+    #: 推論の強さ。上げるとトークンを多く使うので利用枠の消費に直接響く。
+    effort: str | None = None
     attached: list[inbox.Saved] = field(default_factory=list)
     #: Claude を起動する階層。プロジェクト直下か、その配下（``cd:`` で選ぶ）。
     #: None ならプロジェクト直下。

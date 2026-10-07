@@ -49,6 +49,10 @@ class Project:
     # コミット後に claude/<スレッド> ブランチへ push するか（CLAUDE.md §21）。
     # 既定ブランチへは絶対に push しない。merge も行わない。
     allow_push: bool = False
+    #: このプロジェクトの既定モデル。未設定なら runtime の既定。
+    model: str | None = None
+    #: このプロジェクトの既定の推論の強さ（low/medium/high/xhigh/max）。
+    effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,10 @@ class Runtime:
     model: str | None = None
     # 依頼文の先頭で指定できるモデル。未知の名前は実行前に弾く。
     allowed_models: tuple[str, ...] = ("opus", "sonnet", "haiku", "fable")
+    #: 推論の強さの既定。未設定なら Claude Code の既定に任せる。
+    effort: str | None = None
+    #: 依頼文の先頭で指定できる推論の強さ。CLI の --effort が受ける値に合わせる。
+    allowed_efforts: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
     # Slack スレッドと Claude Code セッションを紐付けるか（CLAUDE.md §11, §23.2）
     session_continuation: bool = True
     session_store_path: Path = BASE_DIR / "state" / "sessions.json"
@@ -214,6 +222,8 @@ def _parse_projects(raw: dict, profiles: dict[str, PermissionProfile]) -> dict[s
             name=body.get("name") or key,
             channel_id=channel_id,
             working_directory=path.resolve(),
+            model=(str(body["model"]).strip() or None) if body.get("model") else None,
+            effort=(str(body["effort"]).strip() or None) if body.get("effort") else None,
             profile=profile,
             allow_implement=allow_implement,
             allow_push=allow_push,
@@ -230,6 +240,10 @@ def _parse_runtime(raw: dict) -> Runtime:
         model=raw.get("model"),
         allowed_models=tuple(
             raw.get("allowed_models") or ("opus", "sonnet", "haiku", "fable")
+        ),
+        effort=(str(raw["effort"]).strip() or None) if raw.get("effort") else None,
+        allowed_efforts=tuple(
+            raw.get("allowed_efforts") or ("low", "medium", "high", "xhigh", "max")
         ),
         session_continuation=bool(raw.get("session_continuation", True)),
         session_store_path=(Path(store) if store else BASE_DIR / "state" / "sessions.json"),
