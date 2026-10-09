@@ -327,7 +327,7 @@ def thread_branch_name(thread_ts: str, prefix: str = "claude") -> str:
     return f"{prefix}/{stamp}-{digest}"
 
 
-def build_commit_message(project_name: str, prompt: str) -> str:
+def build_commit_message(project_name: str, prompt: str, partial: bool = False) -> str:
     """Slack の依頼文から commit メッセージを作る。
 
     件名は依頼の1行目を流用し、本文に依頼全文を残す。後から「なぜこの変更が
@@ -335,9 +335,15 @@ def build_commit_message(project_name: str, prompt: str) -> str:
     """
     first_line = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "変更")
     subject = first_line if len(first_line) <= 60 else first_line[:57] + "..."
+    if partial:
+        # 完了していないことを履歴に残す。あとで見たときに「なぜ中途半端なのか」が
+        # 分かるようにするため。
+        subject = "[中断] " + subject
     return (
         f"{subject}\n\n"
-        f"Slack から {project_name} への依頼を Claude Code が実施したもの。\n\n"
+        f"Slack から {project_name} への依頼を Claude Code が実施したもの。\n"
+        + ("実行が最後まで終わらなかったため、途中までの変更です。\n" if partial else "")
+        + "\n"
         f"依頼内容:\n{prompt.strip()}\n\n"
         "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
     )

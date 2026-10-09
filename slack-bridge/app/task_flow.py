@@ -86,8 +86,16 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
         return
 
     if not result.ok:
-        reporter.finish(formatting.failed_header(project.name, reporter.elapsed))
-        thread.post_long(formatting.failure_message(project.name, result.error))
+        reporter.finish(
+            formatting.failed_header(project.name, reporter.elapsed, timed_out=result.timed_out)
+        )
+        thread.post_long(
+            formatting.failure_message(project.name, result.error, timed_out=result.timed_out)
+        )
+        # 失敗しても成果は回収する。打ち切りの場合、Claude が書いたファイルは
+        # ディスクに残っている。ここで抜けるとコミットも一覧も出ないので、
+        # 「30分かけた作業が消えた」ように見える（実際に起きた）。
+        _harvest(ctx, thread, task, before, partial=True)
         return
 
     if session_id:
@@ -125,24 +133,8 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
     if result.session_restarted:
         body += formatting.session_restarted_note()
 
-    pushed_sha = None
-    produced: list[str] = []
-    if task.implement and before.head is not None:
-        commit_text, pushed_sha, produced = _commit_and_report(task, before)
-        body += commit_text
-    elif task.implement and before.files is not None:
-        produced = artifacts.changed_since(
-            before.files, artifacts.scan(project.working_directory)
-        )
     thread.post_long(body)
-
-    if task.implement:
-        # _share/ に置かれたものは「共有したい」という意思表示なので自動で添付する。
-        file_flow.auto_share(thread, settings, project)
-
-    # 残りは一覧だけ出す。中身は送らず、番号で取り出せるようにする。
-    _, rest = share_queue.split_shared(produced)
-    file_flow.report_outputs(thread, ctx.outputs, project, rest, base=before.repo)
+    pushed_sha = _harvest(ctx, thread, task, before)
 
     # CI は分単位でかかるので、結果を待たずにここで応答を返し、完了後に追って投稿する。
     # ワーカーを占有しないよう専用スレッドで待つ（max_workers=1 でも他の依頼が詰まらない）。
@@ -153,6 +145,50 @@ def run_task(ctx: BridgeContext, client, task: TaskRequest) -> None:
             daemon=True,
             name="ci-watch",
         ).start()
+
+
+def _harvest(
+    ctx: BridgeContext,
+    thread: Thread,
+    task: TaskRequest,
+    before: "_Before",
+    partial: bool = False,
+) -> str | None:
+    """この実行の成果を回収する。コミット、``_share/`` の添付、出力一覧。
+
+    ``partial=True`` は失敗・打ち切りのあとの回収。**成功時と同じことをする。**
+    打ち切られても Claude が書いたファイルはディスクに残っているので、ここを
+    通さないと作業が消えたように見える。変更が無ければどの処理も何もしない。
+
+    返り値は push できた場合の sha（CI の監視に使う）。
+    """
+    project = task.project
+    if not task.implement:
+        return None
+
+    pushed_sha = None
+    produced: list[str] = []
+    try:
+        if before.head is not None:
+            commit_text, pushed_sha, produced = _commit_and_report(task, before, partial=partial)
+            thread.post_long(commit_text)
+        elif before.files is not None:
+            produced = artifacts.changed_since(
+                before.files, artifacts.scan(project.working_directory)
+            )
+    except Exception:  # noqa: BLE001 - 回収の失敗で返信そのものを落とさない
+        logger.exception("成果の回収に失敗しました project=%s", project.key)
+
+    try:
+        # _share/ に置かれたものは「共有したい」という意思表示なので自動で添付する。
+        file_flow.auto_share(thread, ctx.settings, project)
+        # 残りは一覧だけ出す。中身は送らず、番号で取り出せるようにする。
+        _, rest = share_queue.split_shared(produced)
+        file_flow.report_outputs(thread, ctx.outputs, project, rest, base=before.repo)
+    except Exception:  # noqa: BLE001
+        logger.exception("ファイルの受け渡しに失敗しました project=%s", project.key)
+
+    return pushed_sha
 
 
 class _Before:
@@ -194,7 +230,9 @@ def _snapshot(task: TaskRequest) -> _Before:
     return _Before(None, artifacts.scan(root))
 
 
-def _commit_and_report(task: TaskRequest, before: "_Before") -> tuple[str, str | None, list[str]]:
+def _commit_and_report(
+    task: TaskRequest, before: "_Before", partial: bool = False
+) -> tuple[str, str | None, list[str]]:
     """この実行で変わったファイルを commit し、報告文を組み立てる（CLAUDE.md §21）。
 
     返り値の3つめは、この実行で変わったファイルの一覧。Slack への共有候補として
@@ -223,7 +261,9 @@ def _commit_and_report(task: TaskRequest, before: "_Before") -> tuple[str, str |
 
     try:
         commit = git_ops.commit_changes(
-            cwd, changed, git_ops.build_commit_message(project.name, task.prompt)
+            cwd,
+            changed,
+            git_ops.build_commit_message(project.name, task.prompt, partial=partial),
         )
     except (git_ops.GitError, OSError) as exc:
         logger.exception("コミットに失敗しました project=%s", project.key)

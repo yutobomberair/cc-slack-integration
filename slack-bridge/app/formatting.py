@@ -253,7 +253,17 @@ def completed_header(
     )
 
 
-def failed_header(project_name: str, elapsed: float) -> str:
+def failed_header(project_name: str, elapsed: float, timed_out: bool = False) -> str:
+    """打ち切りと普通の失敗は分けて書く。
+
+    打ち切りなら、やり直すのではなく「続きを頼む」のが正しい対処なので、
+    同じ文面にすると利用者を誤らせる。
+    """
+    if timed_out:
+        return (
+            f":hourglass: 時間切れで中断しました。（{format_duration(elapsed)}）\n"
+            f"Project: *{project_name}*"
+        )
     return (
         f":x: 実行に失敗しました。（{format_duration(elapsed)}）\n"
         f"Project: *{project_name}*"
@@ -415,7 +425,15 @@ def session_restarted_note() -> str:
 
 
 
-def failure_message(project_name: str, error: str) -> str:
+def failure_message(project_name: str, error: str, timed_out: bool = False) -> str:
+    if timed_out:
+        return (
+            ":hourglass: 実行が時間切れで中断しました。\n"
+            f"Project: *{project_name}*\n\n"
+            f"{error}\n\n"
+            "ここまでの変更はこの下にまとめます。"
+            "続きが必要なら、同じスレッドで依頼すれば文脈を引き継げます。"
+        )
     return (
         ":x: Claude Code の実行に失敗しました。\n"
         f"Project: *{project_name}*\n\n"

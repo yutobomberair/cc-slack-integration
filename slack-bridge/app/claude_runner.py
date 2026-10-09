@@ -49,6 +49,10 @@ class ClaudeResult:
     model: str | None = None
     #: 複数のモデルが使われた場合の全部（fallback が働いたときなど）。
     models: list = field(default_factory=list)
+    #: 制限時間を超えて打ち切った場合に True。
+    #: 普通の失敗と区別するのが要点。打ち切りでは Claude が書いたファイルが
+    #: ディスクに残っているので、呼び出し側が回収できる。
+    timed_out: bool = False
 
 
 def resolve_cli() -> str:
@@ -197,6 +201,7 @@ def _run_once(
         return ClaudeResult(
             ok=False,
             error=f"実行が制限時間 {runtime.timeout_seconds} 秒を超えたため中断しました。",
+            timed_out=True,
         )
     except OSError as exc:
         logger.exception("claude の起動に失敗しました")

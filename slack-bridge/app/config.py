@@ -57,7 +57,7 @@ class Project:
 
 @dataclass(frozen=True)
 class Runtime:
-    timeout_seconds: int = 1800
+    timeout_seconds: int = 10800
     max_workers: int = 1
     model: str | None = None
     # 依頼文の先頭で指定できるモデル。未知の名前は実行前に弾く。
@@ -235,7 +235,7 @@ def _parse_projects(raw: dict, profiles: dict[str, PermissionProfile]) -> dict[s
 def _parse_runtime(raw: dict) -> Runtime:
     store = raw.get("session_store_path")
     return Runtime(
-        timeout_seconds=int(raw.get("timeout_seconds") or 1800),
+        timeout_seconds=int(raw.get("timeout_seconds") or 10800),
         max_workers=max(1, int(raw.get("max_workers") or 1)),
         model=raw.get("model"),
         allowed_models=tuple(

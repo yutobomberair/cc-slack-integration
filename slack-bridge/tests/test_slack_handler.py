@@ -859,3 +859,138 @@ def test_validate_rejects_unknown_values():
 
 def test_validate_is_case_insensitive():
     assert model_prefs.validate("model", "OPUS", ["opus"]) == "opus"
+
+
+# --------------------------------------------------------------------------
+# 時間切れでも成果を失わない
+#
+# 以前は失敗・打ち切りで早期 return していたため、Claude が書いたファイルが
+# コミットも一覧もされず「30分かけた作業が消えた」ように見えた。
+# 打ち切られても実体はディスクに残っているので、必ず回収する。
+# --------------------------------------------------------------------------
+
+def test_timeout_still_commits_what_was_written(dispatch, ran, nested, monkeypatch):
+    subprocess.run(["git", "init", "-q", "."], cwd=nested, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "init", "--allow-empty"], cwd=nested, check=True)
+
+    def timed_out(**kwargs):
+        # 打ち切られる前に Claude がファイルを書いていた状況
+        (Path(kwargs["working_directory"]) / "half_done.py").write_text("x", encoding="utf-8")
+        return ClaudeResult(
+            ok=False, error="制限時間を超えたため中断しました。", timed_out=True
+        )
+
+    monkeypatch.setattr(claude_runner, "run", timed_out)
+    client = FakeClient()
+    dispatch(client, text="重い作業をして")
+
+    committed = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"],
+        cwd=nested, capture_output=True, text=True, check=True,
+    ).stdout
+    assert "half_done.py" in committed
+
+
+def test_timeout_is_described_as_interrupted_not_failed(dispatch, ran, monkeypatch):
+    monkeypatch.setattr(
+        claude_runner,
+        "run",
+        lambda **k: ClaudeResult(ok=False, error="制限時間を超えました。", timed_out=True),
+    )
+    client = FakeClient()
+    dispatch(client, text="重い作業をして")
+
+    everything = " ".join(client.texts + [u.get("text", "") for u in client.updates])
+    # やり直すのではなく「続きを頼む」のが正しい対処なので、そう案内する
+    assert "時間切れ" in everything
+    assert "続き" in everything
+
+
+def test_timeout_still_lists_outputs(dispatch, ran, nested, monkeypatch):
+    def timed_out(**kwargs):
+        (Path(kwargs["working_directory"]) / "report.md" ).write_text("途中", encoding="utf-8")
+        return ClaudeResult(ok=False, error="時間切れ", timed_out=True)
+
+    monkeypatch.setattr(claude_runner, "run", timed_out)
+    client = FakeClient()
+    dispatch(client, text="レポートを作って")
+
+    assert client.said("report.md")       # 番号で取り出せる
+
+
+def test_timeout_still_attaches_share_dir(dispatch, ran, nested, monkeypatch):
+    def timed_out(**kwargs):
+        share = Path(kwargs["working_directory"]) / "_share"
+        share.mkdir(exist_ok=True)
+        (share / "partial.md").write_text("途中", encoding="utf-8")
+        return ClaudeResult(ok=False, error="時間切れ", timed_out=True)
+
+    monkeypatch.setattr(claude_runner, "run", timed_out)
+    client = FakeClient()
+    dispatch(client, text="資料を作って")
+
+    assert [u["title"] for u in client.uploads] == ["_share/partial.md"]
+
+
+def test_partial_commit_is_marked_in_the_history(dispatch, ran, nested, monkeypatch):
+    """あとで履歴を見たときに「なぜ中途半端なのか」が分かるようにする。"""
+    subprocess.run(["git", "init", "-q", "."], cwd=nested, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "init", "--allow-empty"], cwd=nested, check=True)
+
+    def timed_out(**kwargs):
+        (Path(kwargs["working_directory"]) / "x.py").write_text("x", encoding="utf-8")
+        return ClaudeResult(ok=False, error="時間切れ", timed_out=True)
+
+    monkeypatch.setattr(claude_runner, "run", timed_out)
+    dispatch(FakeClient(), text="作って")
+
+    # text=True だけだと Windows の locale（cp932）で復号され、git の UTF-8 出力が
+    # 壊れる。本番の app/git_ops.py は encoding="utf-8" を指定している。
+    subject = subprocess.run(
+        ["git", "log", "-1", "--format=%s"], cwd=nested,
+        capture_output=True, check=True,
+    ).stdout.decode("utf-8")
+    assert "[中断]" in subject
+
+
+def test_ordinary_failure_also_harvests(dispatch, ran, nested, monkeypatch):
+    # 打ち切りでなくても、書かれたものは回収する
+    def failed(**kwargs):
+        (Path(kwargs["working_directory"]) / "oops.md").write_text("x", encoding="utf-8")
+        return ClaudeResult(ok=False, error="API エラー")
+
+    monkeypatch.setattr(claude_runner, "run", failed)
+    client = FakeClient()
+    dispatch(client, text="作って")
+
+    assert client.said("oops.md")
+
+
+def test_failure_without_changes_stays_quiet(dispatch, ran, nested, monkeypatch):
+    # 何も書かれていなければ、回収は何もしない
+    monkeypatch.setattr(
+        claude_runner, "run", lambda **k: ClaudeResult(ok=False, error="即死")
+    )
+    client = FakeClient()
+    dispatch(client, text="作って")
+
+    assert not client.said(":paperclip:")
+    assert client.uploads == []
+
+
+def test_investigate_mode_harvests_nothing(dispatch, ran, nested, monkeypatch):
+    # 調査モードでは書き込めないので回収する対象が無い
+    monkeypatch.setattr(
+        claude_runner, "run", lambda **k: ClaudeResult(ok=False, error="時間切れ", timed_out=True)
+    )
+    client = FakeClient()
+    dispatch(client, text="調査: 構成を教えて")
+
+    assert client.uploads == []
+
+
+def test_timeout_limit_is_generous(settings):
+    """「終わるまで待つ」方針。ただし完全に無くさない（max_workers=1 のため）。"""
+    assert settings.runtime.timeout_seconds >= 7200

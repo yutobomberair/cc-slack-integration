@@ -84,8 +84,18 @@ permission_profiles:
 
 
 runtime:
-  # Claude Code 1回あたりの実行時間上限（秒）
-  timeout_seconds: 1800
+  # Claude Code 1回あたりの実行時間上限（秒）。
+  #
+  # 「終わるまで待つ」のが基本方針なので長めに取る。進捗表示は chat.update で
+  # 更新し続けるため、待っている間も状態は見える。
+  #
+  # 完全に無くさないのは max_workers が 1 のため。claude が本当にハングすると
+  # ワーカーを占有し、全プロジェクトの依頼が止まる。復旧手段がブリッジの再起動
+  # だけになるので、歯止めは残す。
+  #
+  # 超えた場合も、Claude が書いたファイルはコミットして一覧に出す
+  # （app/task_flow.py の _harvest）。作業が消えることはない。
+  timeout_seconds: 10800
   # 同時に走らせる Claude Code プロセスの数（MVP は 1 = 逐次実行）
   max_workers: 1
   # 省略時は Claude Code の既定モデル。"opus" / "sonnet" / "haiku" など。
