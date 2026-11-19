@@ -55,6 +55,34 @@ projects:
     # リモート未設定のため push できない（許可しても Bridge 側でスキップ）
     allow_push: false
 
+  nishuro-homepage:
+    channel_id: "C0CEB9B552P"   # Slack: #nishuro-homepage
+    name: "nishuro-homepage"
+    working_directory: "C:/Users/yutob/work_env/nishuro_homepage"
+    profile: implement
+    allow_implement: true
+    # git 管理外のため push 不可。変更の取り消し手段が無い点は business-contest と同じ
+    allow_push: false
+
+  fovision:
+    channel_id: "C0CKJ0D132Q"   # Slack: #fovision（プライベートチャンネル）
+    name: "fovision"
+    working_directory: "C:/Users/yutob/work_env/FoVision"
+    profile: implement
+    allow_implement: true
+    # origin: git@github.com:yutobomberair/FoVision.git
+    allow_push: true
+
+  coda:
+    channel_id: "C0CL90MFPRN"   # Slack: #coda（プライベートチャンネル）
+    name: "coda"
+    working_directory: "C:/Users/yutob/work_env/coda"
+    profile: implement
+    allow_implement: true
+    # origin: https://github.com/yutobomberair/coda.git
+    # 競馬シミュレータ TEN_sim（Visualize_Station/TEN_sim）を含む
+    allow_push: true
+
 
 # Claude Code CLI の権限プロファイル（CLAUDE.md §20）。
 # Phase 1 では investigate のみを使う。implement は Phase 3 で解禁する。
